@@ -87,6 +87,7 @@ local State = {
     AdaptiveStrength = 35,
     WallB = false,
     AutoSwap = false,
+    AutoReload = false,
     TriggerB = false,
     SemiAutomatic = false,
     SemiAutomaticActive = false,
@@ -106,15 +107,18 @@ local State = {
     AutoPickup = false,
     AntiFence = false,
     Spinbot = false,
+    SpinBind = Enum.KeyCode.Unknown,
     SpinSpeed = 45,
     TweenClickTP = false,
     TweenClickBind = Enum.KeyCode.Unknown,
     TweenSpeed = 75,
     WalkSpeed = 16,
+    SpeedMode = "Direct",
     AutoBhop = false,
     VFly = false,
     VFlyBind = Enum.KeyCode.Unknown,
     VFlySpeed = 50,
+    VisualHz = 60,
     NoFog = false,
     NoBlur = false,
     DisableShadows = false,
@@ -144,6 +148,7 @@ local wallBCleanup
 local wallBRefreshTeams
 local wallBSetEnabled
 local fastShootCleanup
+local autoReloadCleanup
 local triggerBCleanup
 local semiAutomaticCleanup
 local PlayerFeatures = {}
@@ -265,325 +270,190 @@ local function inputIsOverApp(input)
         and position.Y <= topLeft.Y + size.Y
 end
 
-local fastShootOriginals = setmetatable({}, {__mode = "k"})
-local fastShootBoundBackpack
-local fastShootBoundCharacter
-local fastShootBackpackConnection
-local fastShootCharacterConnection
-local fastShootMouseHeld = false
-local fastShootGeneration = 0
+local fastShootOldNamecall
 
-local function getEquippedFastShootGun()
-    local character = LocalPlayer.Character
-    local object = character and character:FindFirstChildOfClass("Tool")
-    if object and object:GetAttribute("ToolType") == "Gun" then
-        return object
-    end
-    return nil
-end
-
-local function rememberFastShootAttribute(tool, attribute)
-    local values = fastShootOriginals[tool]
-    if not values then
-        values = {}
-        fastShootOriginals[tool] = values
-    end
-    if values[attribute] == nil then
-        values[attribute] = {
-            Value = tool:GetAttribute(attribute),
-        }
-    end
-end
-
-local function setFastShootAttribute(tool, attribute, value)
-    local current = tool:GetAttribute(attribute)
-    if current == nil then
-        return
-    end
-    rememberFastShootAttribute(tool, attribute)
-    if current ~= value then
-        tool:SetAttribute(attribute, value)
-    end
-end
-
-local function applyFastShootGun(tool)
-    if not State.FastShoot
-        or not tool
-        or not tool:IsA("Tool")
-        or tool:GetAttribute("ToolType") ~= "Gun" then
+local function installFastShootHook()
+    if fastShootOldNamecall
+        or type(hookmetamethod) ~= "function"
+        or type(newcclosure) ~= "function"
+        or type(getnamecallmethod) ~= "function" then
         return
     end
 
-    local autoFire = not (
-        State.SemiAutomatic
-        and State.SemiAutomaticActive
-        and (tool.Name == "AK-47" or tool.Name == "MP5")
-    )
+    fastShootOldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+        local method = getnamecallmethod()
+        local args = {...}
 
-    setFastShootAttribute(tool, "AutoFire", autoFire)
-    setFastShootAttribute(tool, "FireRate", 0.05)
-    setFastShootAttribute(tool, "Range", 999999)
-    setFastShootAttribute(tool, "AccurateRange", 999999)
-    setFastShootAttribute(tool, "SpreadRadius", 0)
-end
+        if method == "GetAttributes" and State.FastShoot then
+            local result = fastShootOldNamecall(self, unpack(args))
 
-local function scanFastShootContainer(container)
-    if not container then
-        return
-    end
-    for _, object in ipairs(container:GetChildren()) do
-        applyFastShootGun(object)
-    end
-end
+            if typeof(result) == "table" then
+                result.AutoFire = true
+                result.FireRate = 0.05
+                result.Range = 999999999
+                result.Spread = 999999999
+                result.AccurateRange = 9999999999
+                result.SpreadRadius = 0
 
-local function refreshFastShootGuns()
-    scanFastShootContainer(LocalPlayer:FindFirstChildOfClass("Backpack"))
-    scanFastShootContainer(LocalPlayer.Character)
+                if State.SemiAutomatic
+                    and State.SemiAutomaticActive
+                    and self:IsA("Tool")
+                    and (self.Name == "AK-47" or self.Name == "MP5") then
+                    result.AutoFire = false
+                end
+            end
+
+            return result
+        end
+
+        return fastShootOldNamecall(self, ...)
+    end))
 end
 
 local function stopFastShootHold()
-    fastShootMouseHeld = false
-    fastShootGeneration += 1
-    local gun = getEquippedFastShootGun()
-    if gun then
-        pcall(function()
-            gun:Deactivate()
-        end)
-    end
 end
 
-local function restoreFastShootGuns()
-    for tool, attributes in pairs(fastShootOriginals) do
-        if tool and tool.Parent then
-            for attribute, original in pairs(attributes) do
-                pcall(function()
-                    tool:SetAttribute(attribute, original.Value)
-                    if attribute == "AutoFire"
-                        and State.SemiAutomatic
-                        and State.SemiAutomaticActive
-                        and (tool.Name == "AK-47" or tool.Name == "MP5") then
-                        tool:SetAttribute("AutoFire", false)
-                    end
-                end)
-            end
-        end
-        fastShootOriginals[tool] = nil
-    end
-end
-
-local function pulseFastShootGun(tool, generation)
-    if not State.FastShoot
-        or not fastShootMouseHeld
-        or generation ~= fastShootGeneration
-        or tool ~= getEquippedFastShootGun()
-        or tool:GetAttribute("IsReloading") == true then
-        return
-    end
-    pcall(function()
-        tool:Deactivate()
-    end)
-    task.wait(0.01)
-    if State.FastShoot
-        and fastShootMouseHeld
-        and generation == fastShootGeneration
-        and tool == getEquippedFastShootGun()
-        and tool:GetAttribute("IsReloading") ~= true then
-        pcall(function()
-            tool:Activate()
-        end)
-    end
-end
-
-local function fastShootAmmoState(tool)
-    return tool:GetAttribute("CurrentAmmo"), tool:GetAttribute("Local_CurrentAmmo")
-end
-
-local function startFastShootHold()
-    fastShootGeneration += 1
-    local generation = fastShootGeneration
-
-    task.spawn(function()
-        local currentGun
-        local lastCurrentAmmo
-        local lastLocalAmmo
-        local lastProgress = os.clock()
-        local lastPulse = 0
-
-        while runtimeAlive
-            and State.FastShoot
-            and fastShootMouseHeld
-            and generation == fastShootGeneration do
-            local gun = getEquippedFastShootGun()
-            local now = os.clock()
-
-            if gun then
-                if gun ~= currentGun then
-                    currentGun = gun
-                    applyFastShootGun(gun)
-                    lastCurrentAmmo, lastLocalAmmo = fastShootAmmoState(gun)
-                    lastProgress = now
-                    lastPulse = now
-                    pcall(function()
-                        gun:Activate()
-                    end)
-                elseif gun:GetAttribute("FireRate") ~= 0.05 then
-                    applyFastShootGun(gun)
-                end
-
-                local currentAmmo, localAmmo = fastShootAmmoState(gun)
-                if currentAmmo ~= lastCurrentAmmo or localAmmo ~= lastLocalAmmo then
-                    lastCurrentAmmo = currentAmmo
-                    lastLocalAmmo = localAmmo
-                    lastProgress = now
-                end
-
-                if gun:GetAttribute("IsReloading") == true then
-                    lastProgress = now
-                elseif now - lastProgress >= 0.11 and now - lastPulse >= 0.11 then
-                    lastPulse = now
-                    lastProgress = now
-                    pulseFastShootGun(gun, generation)
-                    lastCurrentAmmo, lastLocalAmmo = fastShootAmmoState(gun)
-                end
-            else
-                currentGun = nil
-                lastCurrentAmmo = nil
-                lastLocalAmmo = nil
-                lastProgress = now
-            end
-
-            task.wait(0.025)
-        end
-    end)
-end
-
-local function setupFastShootBackpack(backpack)
-    if backpack == fastShootBoundBackpack then
-        return
-    end
-    if fastShootBackpackConnection then
-        fastShootBackpackConnection:Disconnect()
-        fastShootBackpackConnection = nil
-    end
-    fastShootBoundBackpack = backpack
-    if not backpack then
-        return
-    end
-
-    scanFastShootContainer(backpack)
-    fastShootBackpackConnection = backpack.ChildAdded:Connect(function(object)
-        if object:IsA("Tool") then
-            applyFastShootGun(object)
-            for _, delayTime in ipairs({0.05, 0.10, 0.25}) do
-                task.delay(delayTime, function()
-                    if runtimeAlive and object.Parent then
-                        applyFastShootGun(object)
-                    end
-                end)
-            end
-        end
-    end)
-end
-
-local function setupFastShootCharacter(character)
-    if character == fastShootBoundCharacter then
-        return
-    end
-    if fastShootCharacterConnection then
-        fastShootCharacterConnection:Disconnect()
-        fastShootCharacterConnection = nil
-    end
-    fastShootBoundCharacter = character
-    if not character then
-        return
-    end
-
-    scanFastShootContainer(character)
-    fastShootCharacterConnection = character.ChildAdded:Connect(function(object)
-        if object:IsA("Tool") then
-            applyFastShootGun(object)
-        end
-    end)
+local function applyFastShootGun()
 end
 
 local function setFastShootEnabled(enabled)
     State.FastShoot = enabled == true
     if State.FastShoot then
-        setupFastShootBackpack(LocalPlayer:FindFirstChildOfClass("Backpack"))
-        setupFastShootCharacter(LocalPlayer.Character)
-        refreshFastShootGuns()
-    else
-        stopFastShootHold()
-        restoreFastShootGuns()
+        installFastShootHook()
     end
 end
 
-connect(UserInputService.InputBegan, function(input, processed)
-    if not State.FastShoot
-        or processed
-        or input.UserInputType ~= Enum.UserInputType.MouseButton1
-        or inputIsOverApp(input)
-        or fastShootMouseHeld then
-        return
-    end
-
-    local gun = getEquippedFastShootGun()
-    if gun
-        and State.SemiAutomatic
-        and State.SemiAutomaticActive
-        and (gun.Name == "AK-47" or gun.Name == "MP5") then
-        applyFastShootGun(gun)
-        return
-    end
-
-    fastShootMouseHeld = true
-    if gun then
-        applyFastShootGun(gun)
+fastShootCleanup = function()
+    State.FastShoot = false
+    if fastShootOldNamecall and type(hookmetamethod) == "function" then
         pcall(function()
-            gun:Activate()
+            hookmetamethod(game, "__namecall", fastShootOldNamecall)
+        end)
+        fastShootOldNamecall = nil
+    end
+end
+
+do
+local autoReloadConnections = {}
+local autoReloadToolConnections = {}
+local autoReloadLastFire = 0
+
+local function disconnectAutoReloadList(list)
+    for _, connection in ipairs(list) do
+        pcall(function()
+            connection:Disconnect()
         end)
     end
-    startFastShootHold()
-end)
+    table.clear(list)
+end
 
-connect(UserInputService.InputEnded, function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 and fastShootMouseHeld then
-        stopFastShootHold()
+local function fireReloadKey()
+    if not State.AutoReload or UserInputService:GetFocusedTextBox() then
+        return
     end
-end)
-
-connect(LocalPlayer.ChildAdded, function(object)
-    if object:IsA("Backpack") then
-        setupFastShootBackpack(object)
+    if os.clock() - autoReloadLastFire < 0.20 then
+        return
     end
-end)
 
-connect(LocalPlayer.CharacterAdded, function(character)
-    stopFastShootHold()
-    setupFastShootCharacter(character)
-    task.defer(function()
-        if runtimeAlive then
-            setupFastShootBackpack(LocalPlayer:FindFirstChildOfClass("Backpack"))
-            refreshFastShootGuns()
-        end
+    local character = LocalPlayer.Character
+    local tool = character and character:FindFirstChildOfClass("Tool")
+    if not tool then
+        return
+    end
+
+    local ammo = tool:GetAttribute("Local_CurrentAmmo")
+    if ammo == nil then
+        ammo = tool:GetAttribute("CurrentAmmo")
+    end
+    if type(ammo) ~= "number" or ammo > 0 then
+        return
+    end
+
+    if type(keypress) == "function" and type(keyrelease) == "function" then
+        autoReloadLastFire = os.clock()
+        task.spawn(function()
+            pcall(keypress, 0x52)
+            task.wait(0.05)
+            pcall(keyrelease, 0x52)
+        end)
+    end
+end
+
+local function bindAutoReloadTool(tool)
+    disconnectAutoReloadList(autoReloadToolConnections)
+    if not State.AutoReload or not tool or not tool:IsA("Tool") then
+        return
+    end
+    for _, attribute in ipairs({"Local_CurrentAmmo", "CurrentAmmo"}) do
+        autoReloadToolConnections[#autoReloadToolConnections + 1] =
+            tool:GetAttributeChangedSignal(attribute):Connect(fireReloadKey)
+    end
+    task.defer(fireReloadKey)
+end
+
+local function bindAutoReloadHud()
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local home = playerGui and playerGui:FindFirstChild("Home")
+    local hud = home and home:FindFirstChild("hud")
+    local bottom = hud and hud:FindFirstChild("BottomRightFrame")
+    local frame = bottom and bottom:FindFirstChild("GunFrame")
+    local label = frame and frame:FindFirstChild("BulletsLabel")
+    if label and label:IsA("TextLabel") then
+        autoReloadConnections[#autoReloadConnections + 1] = label:GetPropertyChangedSignal("Text"):Connect(function()
+            if State.AutoReload and label.Text ~= "..." then
+                task.defer(fireReloadKey)
+            end
+        end)
+    end
+end
+
+local function bindAutoReloadCharacter(character)
+    if not State.AutoReload then
+        return
+    end
+    bindAutoReloadTool(character and character:FindFirstChildOfClass("Tool"))
+    if character then
+        autoReloadConnections[#autoReloadConnections + 1] = character.ChildAdded:Connect(function(object)
+            if object:IsA("Tool") then
+                bindAutoReloadTool(object)
+            end
+        end)
+        autoReloadConnections[#autoReloadConnections + 1] = character.ChildRemoved:Connect(function(object)
+            if object:IsA("Tool") then
+                task.defer(function()
+                    if runtimeAlive and State.AutoReload then
+                        bindAutoReloadTool(character:FindFirstChildOfClass("Tool"))
+                    end
+                end)
+            end
+        end)
+    end
+end
+
+local function setAutoReloadEnabled(enabled)
+    State.AutoReload = enabled == true
+    disconnectAutoReloadList(autoReloadConnections)
+    disconnectAutoReloadList(autoReloadToolConnections)
+    if not State.AutoReload then
+        return
+    end
+
+    bindAutoReloadHud()
+    bindAutoReloadCharacter(LocalPlayer.Character)
+    autoReloadConnections[#autoReloadConnections + 1] = LocalPlayer.CharacterAdded:Connect(function(character)
+        task.defer(function()
+            if runtimeAlive and State.AutoReload then
+                disconnectAutoReloadList(autoReloadToolConnections)
+                bindAutoReloadCharacter(character)
+                bindAutoReloadHud()
+            end
+        end)
     end)
-end)
+end
 
-setupFastShootBackpack(LocalPlayer:FindFirstChildOfClass("Backpack"))
-setupFastShootCharacter(LocalPlayer.Character)
-
-fastShootCleanup = function()
-    setFastShootEnabled(false)
-    if fastShootBackpackConnection then
-        fastShootBackpackConnection:Disconnect()
-        fastShootBackpackConnection = nil
-    end
-    if fastShootCharacterConnection then
-        fastShootCharacterConnection:Disconnect()
-        fastShootCharacterConnection = nil
-    end
-    fastShootBoundBackpack = nil
-    fastShootBoundCharacter = nil
+autoReloadCleanup = function()
+    setAutoReloadEnabled(false)
+end
 end
 
 do
@@ -670,12 +540,7 @@ local function restoreSemiTools()
     for tool, saved in pairs(semiSavedAutoFire) do
         if tool and tool.Parent then
             pcall(function()
-                if State.FastShoot then
-                    tool:SetAttribute("AutoFire", true)
-                    applyFastShootGun(tool)
-                else
-                    tool:SetAttribute("AutoFire", saved.Value)
-                end
+                tool:SetAttribute("AutoFire", saved.Value)
             end)
         end
         semiSavedAutoFire[tool] = nil
@@ -1625,9 +1490,7 @@ local function disconnectPickupConnections()
 end
 
 local function registerPickup(object)
-    if object:IsA("Model")
-        and object.Name ~= "Model"
-        and object:GetAttribute("ToolName") then
+    if object:IsA("Model") and object:GetAttribute("ToolName") then
         pickupItems[object] = true
     end
 end
@@ -1671,10 +1534,13 @@ local function setAutoPickupEnabled(enabled)
             local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
             local remotes = ReplicatedStorage:FindFirstChild("Remotes")
             local giverPressed = remotes and remotes:FindFirstChild("GiverPressed")
+            if not giverPressed then
+                giverPressed = ReplicatedStorage:FindFirstChild("GiverPressed", true)
+            end
             if root and backpack and giverPressed then
                 for pickup in pairs(pickupItems) do
                     if pickup and pickup.Parent then
-                        local primary = pickup.PrimaryPart
+                        local primary = pickup.PrimaryPart or pickup:FindFirstChildWhichIsA("BasePart", true)
                         local toolName = pickup:GetAttribute("ToolName")
                         if primary
                             and type(toolName) == "string"
@@ -1690,7 +1556,7 @@ local function setAutoPickupEnabled(enabled)
                     end
                 end
             end
-            task.wait(0.10)
+            task.wait(0.05)
         end
     end)
 end
@@ -1869,9 +1735,30 @@ PlayerFeatures.SetAutoPickup = setAutoPickupEnabled
 PlayerFeatures.SetAntiFence = setAntiFenceEnabled
 PlayerFeatures.SetSpinbot = setSpinbotEnabled
 PlayerFeatures.SetSpinSpeed = function(value)
-    State.SpinSpeed = math.clamp(math.floor(value + 0.5), 1, 2000)
+    State.SpinSpeed = math.clamp(math.floor(value + 0.5), 1, 50)
     SpinBot.Speed = State.SpinSpeed
 end
+PlayerFeatures.SetSpinBind = function(binding)
+    State.SpinBind = binding
+end
+
+connect(UserInputService.InputBegan, function(input, processed)
+    if processed
+        or activeCapture
+        or State.CapturedBindingInput == input
+        or UserInputService:GetFocusedTextBox()
+        or inputIsOverApp(input)
+        or not inputMatches(input, State.SpinBind) then
+        return
+    end
+
+    local enabled = not State.Spinbot
+    setSpinbotEnabled(enabled)
+    local control = MovementFeatures.SpinbotToggleControl
+    if control then
+        control:Set(enabled, true)
+    end
+end)
 
 connect(LocalPlayer.CharacterAdded, function()
     task.wait(0.25)
@@ -1923,6 +1810,8 @@ function VFlyLibrary:Enable(speed)
 
     -- Run on RenderStepped so camera movements are synced perfectly
     self.Connection = self.RunService.RenderStepped:Connect(function(dt)
+        if self.UserInputService:GetFocusedTextBox() then return end
+
         local char = self.LocalPlayer.Character
         if not char then return end
 
@@ -2083,6 +1972,7 @@ end
 local Speed = {
     Enabled = false,
     SpeedValue = 16,
+    Mode = "Direct",
     AutoJump = false,
     _conn = nil
 }
@@ -2100,8 +1990,18 @@ local function calculateMoveVector()
     return move
 end
 
-local function onSpeedRenderStep()
+local function moveHorizontalToward(current, target, maxDelta)
+    local delta = target - current
+    local distance = delta.Magnitude
+    if distance <= maxDelta or distance <= 0.0001 then
+        return target
+    end
+    return current + (delta / distance) * maxDelta
+end
+
+local function onSpeedRenderStep(dt)
     if not Speed.Enabled then return end
+    if UserInputService:GetFocusedTextBox() then return end
 
     local char = LocalPlayer.Character
     if not char then return end
@@ -2112,34 +2012,66 @@ local function onSpeedRenderStep()
     if hum:GetState() == Enum.HumanoidStateType.Climbing then return end
 
     local localMove = calculateMoveVector()
-    if localMove == Vector3.zero then return end
+    local moving = localMove ~= Vector3.zero
+    local worldMove = Vector3.zero
 
-    local currentCamera = workspace.CurrentCamera
-    if not currentCamera then return end
+    if moving then
+        local currentCamera = workspace.CurrentCamera
+        if not currentCamera then return end
 
-    local camLook = currentCamera.CFrame.LookVector
-    camLook = Vector3.new(camLook.X, 0, camLook.Z)
-    if camLook.Magnitude <= 0 then return end
-    camLook = camLook.Unit
+        local camLook = currentCamera.CFrame.LookVector
+        camLook = Vector3.new(camLook.X, 0, camLook.Z)
+        if camLook.Magnitude <= 0 then return end
+        camLook = camLook.Unit
 
-    local camRight = currentCamera.CFrame.RightVector
-    camRight = Vector3.new(camRight.X, 0, camRight.Z)
-    if camRight.Magnitude <= 0 then return end
-    camRight = camRight.Unit
+        local camRight = currentCamera.CFrame.RightVector
+        camRight = Vector3.new(camRight.X, 0, camRight.Z)
+        if camRight.Magnitude <= 0 then return end
+        camRight = camRight.Unit
 
-    local worldMove = (camRight * localMove.X) + (camLook * -localMove.Z)
-    if worldMove.Magnitude > 0 then
-        worldMove = worldMove.Unit
+        worldMove = (camRight * localMove.X) + (camLook * -localMove.Z)
+        if worldMove.Magnitude > 0 then
+            worldMove = worldMove.Unit
+        end
     end
 
     local vel = root.AssemblyLinearVelocity
-    root.AssemblyLinearVelocity = Vector3.new(
-        worldMove.X * Speed.SpeedValue,
-        vel.Y,
-        worldMove.Z * Speed.SpeedValue
-    )
 
-    if Speed.AutoJump and hum.FloorMaterial ~= Enum.Material.Air then
+    if Speed.Mode == "Linear" then
+        local currentHorizontal = Vector3.new(vel.X, 0, vel.Z)
+        local targetHorizontal = moving
+            and Vector3.new(
+                worldMove.X * Speed.SpeedValue,
+                0,
+                worldMove.Z * Speed.SpeedValue
+            )
+            or Vector3.zero
+
+        -- Linear mode accelerates/decelerates into the requested direction.
+        -- Reversing direction therefore has to bleed the old speed before
+        -- reaching full speed in the new direction.
+        local acceleration = math.max(70, Speed.SpeedValue * 7.5)
+        local nextHorizontal = moveHorizontalToward(
+            currentHorizontal,
+            targetHorizontal,
+            acceleration * math.max(dt, 1 / 240)
+        )
+
+        root.AssemblyLinearVelocity = Vector3.new(
+            nextHorizontal.X,
+            vel.Y,
+            nextHorizontal.Z
+        )
+    elseif moving then
+        -- Direct mode is the existing immediate-velocity path.
+        root.AssemblyLinearVelocity = Vector3.new(
+            worldMove.X * Speed.SpeedValue,
+            vel.Y,
+            worldMove.Z * Speed.SpeedValue
+        )
+    end
+
+    if moving and Speed.AutoJump and hum.FloorMaterial ~= Enum.Material.Air then
         hum:ChangeState(Enum.HumanoidStateType.Jumping)
     end
 end
@@ -2160,6 +2092,7 @@ end
 
 local function refreshSpeedRuntime()
     Speed.SpeedValue = State.WalkSpeed
+    Speed.Mode = State.SpeedMode
     Speed.AutoJump = State.AutoBhop
     Speed:Toggle(State.WalkSpeed ~= 16 or State.AutoBhop)
 end
@@ -2169,14 +2102,31 @@ local function setWalkSpeed(value)
     refreshSpeedRuntime()
 end
 
+local function setSpeedMode(mode)
+    if mode ~= "Linear" then
+        mode = "Direct"
+    end
+    State.SpeedMode = mode
+    Speed.Mode = mode
+    refreshSpeedRuntime()
+end
+
 local function setAutoBhopEnabled(enabled)
     State.AutoBhop = enabled == true
     refreshSpeedRuntime()
 end
 
+local VFLY_UI_TO_RUNTIME_SCALE = 0.15
+
+local function vFlyRuntimeSpeed(uiSpeed)
+    -- Keep the supplied VFly movement code untouched; only scale the value
+    -- passed into it. This makes the old minimum roughly 85% slower.
+    return math.max(0.05, uiSpeed * VFLY_UI_TO_RUNTIME_SCALE)
+end
+
 local function setVFlySpeed(value)
-    State.VFlySpeed = math.clamp(math.floor(value + 0.5), 5, 90)
-    vfly.Speed = State.VFlySpeed
+    State.VFlySpeed = math.clamp(math.floor(value + 0.5), 5, 100)
+    vfly.Speed = vFlyRuntimeSpeed(State.VFlySpeed)
 end
 
 local function setVFlyEnabled(enabled)
@@ -2185,7 +2135,7 @@ local function setVFlyEnabled(enabled)
 
     if enabled then
         if not vfly.Enabled then
-            vfly:Enable(State.VFlySpeed)
+            vfly:Enable(vFlyRuntimeSpeed(State.VFlySpeed))
         end
     elseif vfly.Enabled then
         vfly:Disable()
@@ -2218,6 +2168,7 @@ MovementFeatures.SetTweenSpeed = function(value)
     State.TweenSpeed = math.clamp(math.floor(value + 0.5), 5, 140)
 end
 MovementFeatures.SetWalkSpeed = setWalkSpeed
+MovementFeatures.SetSpeedMode = setSpeedMode
 MovementFeatures.SetAutoBhop = setAutoBhopEnabled
 MovementFeatures.SetVFly = setVFlyEnabled
 MovementFeatures.SetVFlyBind = function(binding)
@@ -2228,7 +2179,9 @@ MovementFeatures.Cleanup = function()
     setTweenClickEnabled(false)
     setVFlyEnabled(false)
     State.WalkSpeed = 16
+    State.SpeedMode = "Direct"
     State.AutoBhop = false
+    Speed.Mode = "Direct"
     Speed.AutoJump = false
     Speed:Toggle(false)
 end
@@ -3273,22 +3226,32 @@ local function isModeActive(modeName)
         and State.ModeEnabled[modeName] == true
 end
 
+local TargetRuntime
+
 local function clearTargets()
     camTarget = nil
     mouseTarget = nil
     table.clear(adaptivePartCache)
+    if TargetRuntime and TargetRuntime.ClearSilent then
+        TargetRuntime:ClearSilent()
+    end
     if wallBSetEnabled then
         wallBSetEnabled(State.WallB)
     end
 end
 
 local function teamIsExcluded(player)
-    return State.TeamCheck
-        and player.Team ~= nil
-        and State.ExcludedTeams[player.Team.Name] == true
+    if not player then
+        return false
+    end
+    local team = player.Team
+    if team then
+        return State.ExcludedTeams[team.Name] == true
+    end
+    return player.Neutral == true and State.ExcludedTeams.Neutral == true
 end
 
-local TargetRuntime = {
+TargetRuntime = {
     CharacterCache = setmetatable({}, {__mode = "k"}),
     VisibilityCache = setmetatable({}, {__mode = "k"}),
     VisibilityParams = RaycastParams.new(),
@@ -3301,6 +3264,15 @@ local TargetRuntime = {
     SilentY = 0,
 }
 TargetRuntime.VisibilityParams.FilterType = Enum.RaycastFilterType.Exclude
+
+function TargetRuntime:ClearSilent()
+    self.SilentPlayer = nil
+    self.SilentPart = nil
+    self.SilentAt = 0
+    self.SilentX = 0
+    self.SilentY = 0
+    table.clear(self.VisibilityCache)
+end
 
 local function getTargetCharacterParts(player)
     local character = player and player.Character
@@ -3608,9 +3580,6 @@ local function triggerBTarget()
     end
 
     if selected == "Silent" then
-        if State.WallB then
-            return findTarget(mousePosition, true)
-        end
         return findSilentTarget(mousePosition)
     end
 
@@ -4442,6 +4411,14 @@ rememberToggle(WallBSection:Toggle({
 }))
 
 rememberToggle(WallBSection:Toggle({
+    Name = "Auto Reload",
+    Default = false,
+    Callback = function(value)
+        setAutoReloadEnabled(value)
+    end,
+}))
+
+rememberToggle(WallBSection:Toggle({
     Name = "Trigger B",
     Default = false,
     Callback = function(value)
@@ -4476,24 +4453,48 @@ rememberToggle(ChecksSection:Toggle({
     end,
 }))
 
-rememberToggle(ChecksSection:Toggle({
+local teamCheckControl
+local syncingTeamCheck = false
+
+local function refreshTeamRuntime()
+    if wallBRefreshTeams then
+        wallBRefreshTeams()
+    end
+    clearTargets()
+end
+
+local function setCurrentTeamCheck(value, sourceTeam)
+    value = value == true
+    local currentTeam = LocalPlayer.Team
+
+    State.TeamCheck = value
+
+    if currentTeam and string.lower(currentTeam.Name) ~= "neutral" then
+        State.ExcludedTeams[currentTeam.Name] = value
+
+        local currentControl = teamControls[currentTeam]
+        if currentControl and sourceTeam ~= currentTeam then
+            currentControl:Set(value, true)
+        end
+    end
+
+    if teamCheckControl then
+        teamCheckControl:Set(value, true)
+    end
+end
+
+teamCheckControl = rememberToggle(ChecksSection:Toggle({
     Name = "Team Check",
     Default = false,
     Callback = function(value)
-        State.TeamCheck = value
-        if value
-            and LocalPlayer.Team
-            and string.lower(LocalPlayer.Team.Name) ~= "neutral" then
-            State.ExcludedTeams[LocalPlayer.Team.Name] = true
-            local control = teamControls[LocalPlayer.Team]
-            if control then
-                control:Set(true, true)
-            end
+        if syncingTeamCheck then
+            return
         end
-        if wallBRefreshTeams then
-            wallBRefreshTeams()
-        end
-        clearTargets()
+
+        syncingTeamCheck = true
+        setCurrentTeamCheck(value)
+        syncingTeamCheck = false
+        refreshTeamRuntime()
     end,
 }))
 
@@ -4502,22 +4503,38 @@ local function addTeam(team)
         return
     end
     if string.lower(team.Name) == "neutral" then
-        State.ExcludedTeams[team.Name] = true
+        State.ExcludedTeams[team.Name] = State.ExcludedTeams[team.Name] == true
         return
     end
-    local isOwnTeam = State.TeamCheck and team == LocalPlayer.Team
-    State.ExcludedTeams[team.Name] = isOwnTeam
-    teamControls[team] = rememberToggle(ChecksSection:Toggle({
+
+    local existing = State.ExcludedTeams[team.Name]
+    local isOwnTeam = team == LocalPlayer.Team
+    local defaultValue = existing == true or (existing == nil and isOwnTeam and State.TeamCheck)
+    State.ExcludedTeams[team.Name] = defaultValue
+
+    local control
+    control = rememberToggle(ChecksSection:Toggle({
         Name = "  " .. team.Name,
-        Default = isOwnTeam,
+        Default = defaultValue,
         Callback = function(value)
-            State.ExcludedTeams[team.Name] = value
-            if wallBRefreshTeams then
-                wallBRefreshTeams()
+            State.ExcludedTeams[team.Name] = value == true
+
+            if team == LocalPlayer.Team and not syncingTeamCheck then
+                syncingTeamCheck = true
+                setCurrentTeamCheck(value, team)
+                syncingTeamCheck = false
             end
-            clearTargets()
+
+            refreshTeamRuntime()
         end,
     }))
+    teamControls[team] = control
+
+    if isOwnTeam then
+        syncingTeamCheck = true
+        setCurrentTeamCheck(defaultValue, team)
+        syncingTeamCheck = false
+    end
 end
 
 for _, team in ipairs(Teams:GetTeams()) do
@@ -4531,20 +4548,30 @@ connect(Teams.ChildAdded, function(child)
 end)
 
 connect(LocalPlayer:GetPropertyChangedSignal("Team"), function()
-    if LocalPlayer.Team and string.lower(LocalPlayer.Team.Name) ~= "neutral" then
-        addTeam(LocalPlayer.Team)
-        if State.TeamCheck then
-            State.ExcludedTeams[LocalPlayer.Team.Name] = true
-            local control = teamControls[LocalPlayer.Team]
-            if control then
-                control:Set(true, true)
-            end
+    local currentTeam = LocalPlayer.Team
+
+    if currentTeam and string.lower(currentTeam.Name) ~= "neutral" then
+        addTeam(currentTeam)
+
+        local value = State.ExcludedTeams[currentTeam.Name] == true
+
+        syncingTeamCheck = true
+        setCurrentTeamCheck(value, currentTeam)
+        local control = teamControls[currentTeam]
+        if control then
+            control:Set(value, true)
         end
+        syncingTeamCheck = false
+    else
+        syncingTeamCheck = true
+        State.TeamCheck = false
+        if teamCheckControl then
+            teamCheckControl:Set(false, true)
+        end
+        syncingTeamCheck = false
     end
-    if wallBRefreshTeams then
-        wallBRefreshTeams()
-    end
-    clearTargets()
+
+    refreshTeamRuntime()
 end)
 
 local baseWallBY = WallBSection.Y
@@ -5136,20 +5163,14 @@ entitylib.targetCheck = function(entity)
     if entity.NPC then
         return true
     end
-    if not SETTINGS.TeamCheck then
-        return true
+    if not entity.Player then
+        return false
     end
-    if not entity.Player or not entity.Player.Team then
-        return true
-    end
-    return State.ExcludedTeams[entity.Player.Team.Name] ~= true
+    return not teamIsExcluded(entity.Player)
 end
 
 entitylib.isVulnerable = function(entity, attackCheck)
-    if SETTINGS.TeamCheck
-        and entity.Player
-        and entity.Player.Team
-        and State.ExcludedTeams[entity.Player.Team.Name] == true then
+    if entity.Player and teamIsExcluded(entity.Player) then
         return false
     end
     if attackCheck
@@ -5498,13 +5519,35 @@ local function wallBBulletHook(...)
         return oldBullet(...)
     end
 
-    local gunData = debugGetUpvalue(gun.Shoot, 10)
-    local entity, targetPart = findVictim(
-        origin,
-        gunData and gunData.Range or 1000
-    )
-    if not entity or not targetPart then
+    -- Wall Bang must use the same target pipeline as every other Combat mode.
+    -- This keeps Team Check, Dead Check, Wall Check, FOV, Aim Part and
+    -- Adaptive Aim authoritative instead of letting the separate Wall Bang
+    -- entity scanner choose a different player.
+    local targetPlayer, targetPart = findSilentTarget(UserInputService:GetMouseLocation())
+    if not targetPlayer or not targetPart or not validTarget(targetPlayer) then
         return oldBullet(...)
+    end
+    if State.WallCheck and not partVisible(targetPart) then
+        return oldBullet(...)
+    end
+
+    local targetCharacter, targetHumanoid, targetRoot = getTargetCharacterParts(targetPlayer)
+    if not targetCharacter or not targetHumanoid or not targetRoot then
+        return oldBullet(...)
+    end
+
+    local entity = entitylib.getEntity(targetPlayer)
+    if not entity then
+        entity = {
+            Character = targetCharacter,
+            Humanoid = targetHumanoid,
+            RootPart = targetRoot,
+            Head = targetCharacter:FindFirstChild("Head") or targetPart,
+            Player = targetPlayer,
+            Health = targetHumanoid.Health,
+            MaxHealth = targetHumanoid.MaxHealth,
+            SpawnTime = 0,
+        }
     end
 
     args[2] = predictedPosition(targetPart) or targetPart.Position
@@ -5619,7 +5662,12 @@ end
 wallBRefreshTeams = function()
     SETTINGS.TeamCheck = State.TeamCheck
     if entitylib.Running then
-        entitylib.refresh()
+        for _, entity in ipairs(entitylib.List) do
+            entity.Targetable = entitylib.targetCheck(entity)
+        end
+    end
+    if TargetRuntime and TargetRuntime.ClearSilent then
+        TargetRuntime:ClearSilent()
     end
 end
 end
@@ -5645,6 +5693,7 @@ local ESP = {
     DistanceEnabled = false,
     HealthBarEnabled = false,
     HealthTextEnabled = false,
+    UpdateHz = 60,
     BoxColor = Color3.fromRGB(255, 255, 255),
     BoxFillColor = Color3.fromRGB(255, 255, 255),
     TextColor = Color3.fromRGB(255, 255, 255),
@@ -5895,7 +5944,7 @@ local function ensureText(set, key, color)
 end
 
 local squareKeys = {
-    "Box", "BoxOutline", "BoxFill", "HealthBarOutline", "HealthBarFill",
+    "Box", "BoxOutline", "BoxFill", "HealthBarOutline", "HealthBarBack", "HealthBarFill",
 }
 local textKeys = {
     "NameText", "HostileText", "ForcefieldText", "ItemText",
@@ -6036,6 +6085,7 @@ local function trimInactiveESPObjects()
         if not ESP.HealthTextEnabled then destroySetText(set, "HealthText") end
         if not ESP.HealthBarEnabled then
             destroySetObject(set, "HealthBarOutline")
+            destroySetObject(set, "HealthBarBack")
             destroySetObject(set, "HealthBarFill")
         end
 
@@ -6404,7 +6454,6 @@ local namePulseFrom = Color3.fromRGB(255, 255, 255)
 local namePulseTo = Color3.fromRGB(170, 0, 255)
 local espHadActiveFeature = false
 local espAccumulator = 0
-local espUpdateInterval = 1 / 60
 local lastEspFeatureSignature = -1
 
 local function hidePlayerESP(player)
@@ -6472,8 +6521,7 @@ connect(RunService.RenderStepped, function(deltaTime)
         trimInactiveESPObjects()
     end
 
-    -- 60 Hz keeps the overlay visually fluid while preventing high-FPS clients
-    -- from doing identical ESP projection/UI work 140-240 times per second.
+    local espUpdateInterval = 1 / math.clamp(ESP.UpdateHz or 60, 60, 144)
     espAccumulator = math.min(espAccumulator + math.max(deltaTime, 0), espUpdateInterval * 3)
     if espAccumulator < espUpdateInterval then
         return
@@ -6791,9 +6839,11 @@ connect(RunService.RenderStepped, function(deltaTime)
             if ESP.HealthBarEnabled then
                 local height = maxY - minY
                 local outline = ensureSquare(set, "HealthBarOutline", true, black, 1, 1)
+                local backing = ensureSquare(set, "HealthBarBack", true, Color3.fromRGB(55, 15, 15), 1, 1)
                 local fill = ensureSquare(set, "HealthBarFill", true, healthFull, 1, 1)
                 setSquare(outline, barX - 1, minY - 1, barWidth + 2, height + 2, black)
-                local fillHeight = height * healthAlpha
+                setSquare(backing, barX, minY, barWidth, height, Color3.fromRGB(55, 15, 15))
+                local fillHeight = math.max(1, height * healthAlpha)
                 setSquare(
                     fill,
                     barX,
@@ -6804,6 +6854,7 @@ connect(RunService.RenderStepped, function(deltaTime)
                 )
             else
                 setVisible(set.HealthBarOutline, false)
+                setVisible(set.HealthBarBack, false)
                 setVisible(set.HealthBarFill, false)
             end
 
@@ -6838,6 +6889,7 @@ connect(RunService.RenderStepped, function(deltaTime)
             if set.DistanceText then setVisible(set.DistanceText.Object, false) end
             if set.HealthText then setVisible(set.HealthText.Object, false) end
             setVisible(set.HealthBarOutline, false)
+            setVisible(set.HealthBarBack, false)
             setVisible(set.HealthBarFill, false)
         end
 
@@ -6949,6 +7001,18 @@ VisualMain:Dropdown({
         ESP.DisplayNameEnabled = value == "Display Name" or value == "Both"
     end,
 })
+VisualMain:Dropdown({
+    Name = "Hz",
+    Options = {"60", "120", "144"},
+    Default = tostring(State.VisualHz),
+    Callback = function(value)
+        local hz = tonumber(value) or 60
+        State.VisualHz = math.clamp(math.floor(hz + 0.5), 60, 144)
+        ESP.UpdateHz = State.VisualHz
+        espAccumulator = 0
+    end,
+})
+ESP.UpdateHz = State.VisualHz
 rememberToggle(VisualMain:Toggle({
     Name = "Team",
     Default = false,
@@ -7199,25 +7263,6 @@ rememberToggle(PlayerMain:Toggle({
     end,
 }))
 
-local PlayerSpin = makeTitledSection(PlayerPage, "Left", "Spin")
-rememberToggle(PlayerSpin:Toggle({
-    Name = "Spinbot",
-    Default = false,
-    Callback = function(value)
-        PlayerFeatures.SetSpinbot(value)
-    end,
-}))
-PlayerSpin:Slider({
-    Name = "Spin Speed",
-    Minimum = 1,
-    Maximum = 2000,
-    Default = State.SpinSpeed,
-    Decimals = 0,
-    Callback = function(value)
-        PlayerFeatures.SetSpinSpeed(value)
-    end,
-})
-
 local PlayerUtility = makeTitledSection(PlayerPage, "Right", "Utility")
 rememberToggle(PlayerUtility:Toggle({
     Name = "Anti Riot Shield",
@@ -7380,6 +7425,16 @@ tweenSpeedUpdate = function(speed)
 end
 tweenSpeedUpdate(State.TweenSpeed)
 
+if fill then
+    connect(fill:GetPropertyChangedSignal("BackgroundColor3"), function()
+        if runtimeAlive
+            and fill.Parent
+            and fill.BackgroundColor3 ~= currentTweenColor then
+            fill.BackgroundColor3 = currentTweenColor
+        end
+    end)
+end
+
 task.spawn(function()
     while runtimeAlive and fill and fill.Parent do
         if stockSpeedMarker and stockSpeedMarker.Parent then
@@ -7389,6 +7444,53 @@ task.spawn(function()
     end
 end)
 end
+
+local MovementSpinSection = makeTitledSection(MovementPage, "Left", "Spin")
+local spinToggleControl = rememberToggle(MovementSpinSection:Toggle({
+    Name = "Spinbot",
+    Default = State.Spinbot,
+    Callback = function(value)
+        PlayerFeatures.SetSpinbot(value)
+    end,
+}))
+MovementFeatures.SpinbotToggleControl = spinToggleControl
+
+local spinKeybindDisplay
+local spinKeybindControl = MovementSpinSection:Keybind({
+    Name = "Keybind",
+    Default = State.SpinBind,
+    ResetValue = function()
+        return Enum.KeyCode.Unknown
+    end,
+    Callback = function(value)
+        PlayerFeatures.SetSpinBind(value)
+        if spinKeybindDisplay then
+            task.defer(function()
+                if runtimeAlive and spinKeybindDisplay then
+                    spinKeybindDisplay:Set(value)
+                end
+            end)
+        end
+    end,
+})
+spinKeybindDisplay = installExternalKeybind(
+    spinKeybindControl,
+    State.SpinBind,
+    function(value)
+        PlayerFeatures.SetSpinBind(value)
+    end
+)
+
+MovementSpinSection:Slider({
+    Name = "Spin Speed",
+    Minimum = 1,
+    Maximum = 50,
+    Default = State.SpinSpeed,
+    Decimals = 0,
+    Callback = function(value)
+        PlayerFeatures.SetSpinSpeed(value)
+    end,
+})
 
 local VFlySection = makeTitledSection(MovementPage, "Right", "V Fly")
 local vFlyToggleControl = rememberToggle(VFlySection:Toggle({
@@ -7430,7 +7532,7 @@ end
 
 do
 local vFlySpeedMinimum = 5
-local vFlySpeedMaximum = 90
+local vFlySpeedMaximum = 100
 local vFlySpeedUpdate
 local vFlySpeedControl
 vFlySpeedControl = VFlySection:Slider({
@@ -7485,14 +7587,14 @@ local function vFlySpeedColor(speed)
 
     if speed <= 55 then
         return normal
-    elseif speed < 60 then
-        return normal:Lerp(yellow, math.clamp((speed - 55) / 5, 0, 1))
+    elseif speed < 65 then
+        return normal:Lerp(yellow, math.clamp((speed - 55) / 10, 0, 1))
     elseif speed <= 75 then
         return yellow
-    elseif speed <= 80 then
-        return yellow:Lerp(orange, math.clamp((speed - 75) / 5, 0, 1))
+    elseif speed <= 90 then
+        return yellow:Lerp(orange, math.clamp((speed - 75) / 15, 0, 1))
     end
-    return orange:Lerp(red, math.clamp((speed - 80) / 10, 0, 1))
+    return orange:Lerp(red, math.clamp((speed - 90) / 10, 0, 1))
 end
 
 local currentVFlyColor = vFlySpeedColor(State.VFlySpeed)
@@ -7507,11 +7609,58 @@ vFlySpeedUpdate = function(speed)
 end
 vFlySpeedUpdate(State.VFlySpeed)
 
+if fill then
+    connect(fill:GetPropertyChangedSignal("BackgroundColor3"), function()
+        if runtimeAlive
+            and fill.Parent
+            and fill.BackgroundColor3 ~= currentVFlyColor then
+            fill.BackgroundColor3 = currentVFlyColor
+        end
+    end)
+end
+
 -- Slider color is updated only when the value changes; no per-frame UI write.
 end
 MovementFeatures.SetVFlySpeed(50)
 
+do
 local MovementSpeedSection = makeTitledSection(MovementPage, "Right", "Speed")
+
+local speedModeButton = Instance.new("TextButton")
+speedModeButton.Name = "SpeedModeButton"
+speedModeButton.AnchorPoint = Vector2.new(1, 0)
+speedModeButton.Position = UDim2.new(1, -10, 0, 4)
+speedModeButton.Size = UDim2.fromOffset(58, 18)
+speedModeButton.BackgroundTransparency = 1
+speedModeButton.BorderSizePixel = 0
+speedModeButton.Text = State.SpeedMode
+speedModeButton.Font = Enum.Font.GothamMedium
+speedModeButton.TextSize = 9
+speedModeButton.TextColor3 = SectionTitleColors[Consist:GetTheme()] or SectionTitleColors.Dark
+speedModeButton.AutoButtonColor = false
+speedModeButton.ZIndex = 61
+speedModeButton.Parent = MovementSpeedSection.Frame
+
+local speedModeCorner = Instance.new("UICorner")
+speedModeCorner.CornerRadius = UDim.new(0, 5)
+speedModeCorner.Parent = speedModeButton
+
+local speedModeStroke = Instance.new("UIStroke")
+speedModeStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+speedModeStroke.Thickness = 1
+speedModeStroke.Transparency = 0
+speedModeStroke.Color = SectionStrokeColors[Consist:GetTheme()] or SectionStrokeColors.Dark
+speedModeStroke.Parent = speedModeButton
+
+table.insert(sectionTitleLabels, speedModeButton)
+table.insert(sectionStrokes, speedModeStroke)
+
+speedModeButton.MouseButton1Click:Connect(function()
+    local nextMode = State.SpeedMode == "Direct" and "Linear" or "Direct"
+    MovementFeatures.SetSpeedMode(nextMode)
+    speedModeButton.Text = nextMode
+end)
+
 MovementSpeedSection:Slider({
     Name = "Walk Speed",
     Minimum = 16,
@@ -7529,7 +7678,9 @@ rememberToggle(MovementSpeedSection:Toggle({
         MovementFeatures.SetAutoBhop(value)
     end,
 }))
+MovementFeatures.SetSpeedMode(State.SpeedMode)
 MovementFeatures.SetWalkSpeed(State.WalkSpeed)
+end
 
 local WorldPage = Consist:Page("World")
 for _, child in ipairs(WorldPage.Frame:GetChildren()) do
@@ -7781,14 +7932,17 @@ local function cleanup()
         return
     end
     runtimeAlive = false
+    if semiAutomaticCleanup then
+        pcall(semiAutomaticCleanup)
+    end
     if fastShootCleanup then
         pcall(fastShootCleanup)
     end
+    if autoReloadCleanup then
+        pcall(autoReloadCleanup)
+    end
     if triggerBCleanup then
         pcall(triggerBCleanup)
-    end
-    if semiAutomaticCleanup then
-        pcall(semiAutomaticCleanup)
     end
     if PlayerFeatures.Cleanup then
         pcall(PlayerFeatures.Cleanup)
