@@ -92,7 +92,6 @@ local State = {
     SemiAutomaticActive = false,
     SemiAutomaticBind = Enum.KeyCode.Unknown,
     FastShoot = false,
-    FastShootRate = 0.05,
     WallCheck = false,
     DeadCheck = true,
     TeamCheck = false,
@@ -112,6 +111,7 @@ local State = {
     TweenClickBind = Enum.KeyCode.Unknown,
     TweenSpeed = 75,
     WalkSpeed = 16,
+    AutoBhop = false,
     VFly = false,
     VFlyBind = Enum.KeyCode.Unknown,
     VFlySpeed = 50,
@@ -138,12 +138,14 @@ local modeKeybindDisplay
 local heldMode
 local teamControls = {}
 local activeCapture
-local adaptivePartCache = {}
+local adaptivePartCache = setmetatable({}, {__mode = "k"})
 local toggleControls = {}
 local wallBCleanup
 local wallBRefreshTeams
+local wallBSetEnabled
 local fastShootCleanup
 local triggerBCleanup
+local semiAutomaticCleanup
 local PlayerFeatures = {}
 local MovementFeatures = {}
 local WorldFeatures = {}
@@ -248,6 +250,12 @@ local function inputIsOverApp(input)
         and input.UserInputType ~= Enum.UserInputType.MouseButton3 then
         return false
     end
+    if not Consist.Gui
+        or Consist.Gui.Enabled == false
+        or not Consist.App
+        or Consist.App.Visible == false then
+        return false
+    end
     local position = UserInputService:GetMouseLocation()
     local topLeft = Consist.App.AbsolutePosition
     local size = Consist.App.AbsoluteSize
@@ -258,20 +266,18 @@ local function inputIsOverApp(input)
 end
 
 local fastShootOriginals = setmetatable({}, {__mode = "k"})
-local fastShootBackpacks = setmetatable({}, {__mode = "k"})
-local fastShootCharacters = setmetatable({}, {__mode = "k"})
+local fastShootBoundBackpack
+local fastShootBoundCharacter
+local fastShootBackpackConnection
+local fastShootCharacterConnection
 local fastShootMouseHeld = false
 local fastShootGeneration = 0
 
 local function getEquippedFastShootGun()
     local character = LocalPlayer.Character
-    if not character then
-        return nil
-    end
-    for _, object in ipairs(character:GetChildren()) do
-        if object:IsA("Tool") and object:GetAttribute("ToolType") == "Gun" then
-            return object
-        end
+    local object = character and character:FindFirstChildOfClass("Tool")
+    if object and object:GetAttribute("ToolType") == "Gun" then
+        return object
     end
     return nil
 end
@@ -289,6 +295,17 @@ local function rememberFastShootAttribute(tool, attribute)
     end
 end
 
+local function setFastShootAttribute(tool, attribute, value)
+    local current = tool:GetAttribute(attribute)
+    if current == nil then
+        return
+    end
+    rememberFastShootAttribute(tool, attribute)
+    if current ~= value then
+        tool:SetAttribute(attribute, value)
+    end
+end
+
 local function applyFastShootGun(tool)
     if not State.FastShoot
         or not tool
@@ -297,23 +314,17 @@ local function applyFastShootGun(tool)
         return
     end
 
-    local replacements = {
-        AutoFire = not (
-            State.SemiAutomatic
-            and State.SemiAutomaticActive
-            and (tool.Name == "AK-47" or tool.Name == "MP5")
-        ),
-        FireRate = State.FastShootRate,
-        Range = 999999,
-        AccurateRange = 999999,
-        SpreadRadius = 0,
-    }
-    for attribute, value in pairs(replacements) do
-        if tool:GetAttribute(attribute) ~= nil then
-            rememberFastShootAttribute(tool, attribute)
-            tool:SetAttribute(attribute, value)
-        end
-    end
+    local autoFire = not (
+        State.SemiAutomatic
+        and State.SemiAutomaticActive
+        and (tool.Name == "AK-47" or tool.Name == "MP5")
+    )
+
+    setFastShootAttribute(tool, "AutoFire", autoFire)
+    setFastShootAttribute(tool, "FireRate", 0.05)
+    setFastShootAttribute(tool, "Range", 999999)
+    setFastShootAttribute(tool, "AccurateRange", 999999)
+    setFastShootAttribute(tool, "SpreadRadius", 0)
 end
 
 local function scanFastShootContainer(container)
@@ -384,18 +395,17 @@ local function pulseFastShootGun(tool, generation)
 end
 
 local function fastShootAmmoState(tool)
-    return tostring(tool:GetAttribute("CurrentAmmo"))
-        .. ":"
-        .. tostring(tool:GetAttribute("Local_CurrentAmmo"))
+    return tool:GetAttribute("CurrentAmmo"), tool:GetAttribute("Local_CurrentAmmo")
 end
 
 local function startFastShootHold()
     fastShootGeneration += 1
     local generation = fastShootGeneration
+
     task.spawn(function()
         local currentGun
-        local lastFireRate
-        local lastAmmoState
+        local lastCurrentAmmo
+        local lastLocalAmmo
         local lastProgress = os.clock()
         local lastPulse = 0
 
@@ -404,54 +414,64 @@ local function startFastShootHold()
             and fastShootMouseHeld
             and generation == fastShootGeneration do
             local gun = getEquippedFastShootGun()
+            local now = os.clock()
+
             if gun then
-                applyFastShootGun(gun)
-                local fireRate = gun:GetAttribute("FireRate")
-                if gun ~= currentGun or fireRate ~= lastFireRate then
+                if gun ~= currentGun then
                     currentGun = gun
-                    lastFireRate = fireRate
-                    lastAmmoState = fastShootAmmoState(gun)
-                    lastProgress = os.clock()
-                    lastPulse = os.clock()
+                    applyFastShootGun(gun)
+                    lastCurrentAmmo, lastLocalAmmo = fastShootAmmoState(gun)
+                    lastProgress = now
+                    lastPulse = now
                     pcall(function()
                         gun:Activate()
                     end)
+                elseif gun:GetAttribute("FireRate") ~= 0.05 then
+                    applyFastShootGun(gun)
                 end
 
-                local now = os.clock()
-                local ammoState = fastShootAmmoState(gun)
-                if ammoState ~= lastAmmoState then
-                    lastAmmoState = ammoState
+                local currentAmmo, localAmmo = fastShootAmmoState(gun)
+                if currentAmmo ~= lastCurrentAmmo or localAmmo ~= lastLocalAmmo then
+                    lastCurrentAmmo = currentAmmo
+                    lastLocalAmmo = localAmmo
                     lastProgress = now
                 end
 
                 if gun:GetAttribute("IsReloading") == true then
                     lastProgress = now
-                elseif now - lastProgress >= 0.09 and now - lastPulse >= 0.09 then
+                elseif now - lastProgress >= 0.11 and now - lastPulse >= 0.11 then
                     lastPulse = now
                     lastProgress = now
                     pulseFastShootGun(gun, generation)
-                    lastFireRate = gun:GetAttribute("FireRate")
-                    lastAmmoState = fastShootAmmoState(gun)
+                    lastCurrentAmmo, lastLocalAmmo = fastShootAmmoState(gun)
                 end
             else
                 currentGun = nil
-                lastFireRate = nil
-                lastAmmoState = nil
-                lastProgress = os.clock()
+                lastCurrentAmmo = nil
+                lastLocalAmmo = nil
+                lastProgress = now
             end
-            task.wait(0.01)
+
+            task.wait(0.025)
         end
     end)
 end
 
 local function setupFastShootBackpack(backpack)
-    if not backpack or fastShootBackpacks[backpack] then
+    if backpack == fastShootBoundBackpack then
         return
     end
-    fastShootBackpacks[backpack] = true
+    if fastShootBackpackConnection then
+        fastShootBackpackConnection:Disconnect()
+        fastShootBackpackConnection = nil
+    end
+    fastShootBoundBackpack = backpack
+    if not backpack then
+        return
+    end
+
     scanFastShootContainer(backpack)
-    connect(backpack.ChildAdded, function(object)
+    fastShootBackpackConnection = backpack.ChildAdded:Connect(function(object)
         if object:IsA("Tool") then
             applyFastShootGun(object)
             for _, delayTime in ipairs({0.05, 0.10, 0.25}) do
@@ -466,12 +486,20 @@ local function setupFastShootBackpack(backpack)
 end
 
 local function setupFastShootCharacter(character)
-    if not character or fastShootCharacters[character] then
+    if character == fastShootBoundCharacter then
         return
     end
-    fastShootCharacters[character] = true
+    if fastShootCharacterConnection then
+        fastShootCharacterConnection:Disconnect()
+        fastShootCharacterConnection = nil
+    end
+    fastShootBoundCharacter = character
+    if not character then
+        return
+    end
+
     scanFastShootContainer(character)
-    connect(character.ChildAdded, function(object)
+    fastShootCharacterConnection = character.ChildAdded:Connect(function(object)
         if object:IsA("Tool") then
             applyFastShootGun(object)
         end
@@ -546,12 +574,25 @@ setupFastShootCharacter(LocalPlayer.Character)
 
 fastShootCleanup = function()
     setFastShootEnabled(false)
+    if fastShootBackpackConnection then
+        fastShootBackpackConnection:Disconnect()
+        fastShootBackpackConnection = nil
+    end
+    if fastShootCharacterConnection then
+        fastShootCharacterConnection:Disconnect()
+        fastShootCharacterConnection = nil
+    end
+    fastShootBoundBackpack = nil
+    fastShootBoundCharacter = nil
 end
 
 do
 local semiSavedAutoFire = setmetatable({}, {__mode = "k"})
-local semiBackpacks = setmetatable({}, {__mode = "k"})
-local semiCharacters = setmetatable({}, {__mode = "k"})
+local semiBoundBackpack
+local semiBoundCharacter
+local semiBackpackConnection
+local semiCharacterConnection
+local semiCharacterRemovedConnection
 
 local function semiSupported(tool)
     return tool
@@ -563,9 +604,24 @@ end
 -- Keep the real Tool attribute synchronized too, but also override the returned
 -- AutoFire value so full-auto controller loops see these two guns as semi-auto.
 local semiOldNamecall
-if type(hookmetamethod) == "function"
-    and type(newcclosure) == "function"
-    and type(getnamecallmethod) == "function" then
+
+local function uninstallSemiHook()
+    if semiOldNamecall and type(hookmetamethod) == "function" then
+        pcall(function()
+            hookmetamethod(game, "__namecall", semiOldNamecall)
+        end)
+        semiOldNamecall = nil
+    end
+end
+
+local function installSemiHook()
+    if semiOldNamecall
+        or type(hookmetamethod) ~= "function"
+        or type(newcclosure) ~= "function"
+        or type(getnamecallmethod) ~= "function" then
+        return
+    end
+
     semiOldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(object, ...)
         local method = getnamecallmethod()
         if method == "GetAttributes"
@@ -631,13 +687,30 @@ local function refreshSemiTools()
     scanSemiContainer(LocalPlayer.Character)
 end
 
+local function refreshSemiHookForEquipped()
+    if not State.SemiAutomatic or not State.SemiAutomaticActive then
+        uninstallSemiHook()
+        return
+    end
+
+    local character = LocalPlayer.Character
+    local equipped = character and character:FindFirstChildOfClass("Tool")
+    if semiSupported(equipped) then
+        installSemiHook()
+    else
+        uninstallSemiHook()
+    end
+end
+
 local function setSemiRuntimeActive(active)
     State.SemiAutomaticActive = State.SemiAutomatic and active == true
     if State.SemiAutomaticActive then
         stopFastShootHold()
         refreshSemiTools()
+        refreshSemiHookForEquipped()
     else
         restoreSemiTools()
+        uninstallSemiHook()
     end
 end
 
@@ -647,12 +720,20 @@ local function setSemiAutomaticEnabled(enabled)
 end
 
 local function setupSemiBackpack(backpack)
-    if not backpack or semiBackpacks[backpack] then
+    if backpack == semiBoundBackpack then
         return
     end
-    semiBackpacks[backpack] = true
+    if semiBackpackConnection then
+        semiBackpackConnection:Disconnect()
+        semiBackpackConnection = nil
+    end
+    semiBoundBackpack = backpack
+    if not backpack then
+        return
+    end
+
     scanSemiContainer(backpack)
-    connect(backpack.ChildAdded, function(object)
+    semiBackpackConnection = backpack.ChildAdded:Connect(function(object)
         if semiSupported(object) then
             task.defer(function()
                 if runtimeAlive and object.Parent then
@@ -664,20 +745,44 @@ local function setupSemiBackpack(backpack)
 end
 
 local function setupSemiCharacter(character)
-    if not character or semiCharacters[character] then
+    if character == semiBoundCharacter then
         return
     end
-    semiCharacters[character] = true
+    if semiCharacterConnection then
+        semiCharacterConnection:Disconnect()
+        semiCharacterConnection = nil
+    end
+    if semiCharacterRemovedConnection then
+        semiCharacterRemovedConnection:Disconnect()
+        semiCharacterRemovedConnection = nil
+    end
+    semiBoundCharacter = character
+    if not character then
+        refreshSemiHookForEquipped()
+        return
+    end
+
     scanSemiContainer(character)
-    connect(character.ChildAdded, function(object)
+    semiCharacterConnection = character.ChildAdded:Connect(function(object)
         if semiSupported(object) then
             task.defer(function()
                 if runtimeAlive and object.Parent then
                     applySemiTool(object)
+                    refreshSemiHookForEquipped()
                 end
             end)
         end
     end)
+    semiCharacterRemovedConnection = character.ChildRemoved:Connect(function(object)
+        if semiSupported(object) then
+            task.defer(function()
+                if runtimeAlive then
+                    refreshSemiHookForEquipped()
+                end
+            end)
+        end
+    end)
+    refreshSemiHookForEquipped()
 end
 
 connect(UserInputService.InputBegan, function(input, processed)
@@ -708,6 +813,7 @@ connect(LocalPlayer.CharacterAdded, function(character)
             setupSemiBackpack(LocalPlayer:FindFirstChildOfClass("Backpack"))
             if State.SemiAutomaticActive then
                 refreshSemiTools()
+                refreshSemiHookForEquipped()
             end
         end
     end)
@@ -720,6 +826,22 @@ semiAutomaticCleanup = function()
     State.SemiAutomatic = false
     State.SemiAutomaticActive = false
     restoreSemiTools()
+
+    uninstallSemiHook()
+    if semiBackpackConnection then
+        semiBackpackConnection:Disconnect()
+        semiBackpackConnection = nil
+    end
+    if semiCharacterConnection then
+        semiCharacterConnection:Disconnect()
+        semiCharacterConnection = nil
+    end
+    if semiCharacterRemovedConnection then
+        semiCharacterRemovedConnection:Disconnect()
+        semiCharacterRemovedConnection = nil
+    end
+    semiBoundBackpack = nil
+    semiBoundCharacter = nil
 end
 
 MovementFeatures.SetSemiAutomatic = setSemiAutomaticEnabled
@@ -741,79 +863,143 @@ local autoSwapPriorities = {
     M9 = 3,
     Revolver = 4,
 }
-local autoSwapConnection
 local autoSwapLastRun = 0
+local autoSwapConnections = {}
+local autoSwapGunConnections = {}
+
+local function disconnectAutoSwapList(list)
+    for _, connection in ipairs(list) do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+    table.clear(list)
+end
 
 local function getAutoSwapWeapon()
     local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
     if not backpack then
         return nil
     end
-    local weapons = {}
+    local best
+    local bestPriority = math.huge
     for _, tool in ipairs(backpack:GetChildren()) do
         if tool:IsA("Tool")
             and tool:GetAttribute("FireRate") ~= nil
             and (tool:GetAttribute("Local_ReloadSession") or 0) <= 0
             and tool.Name ~= "Taser"
             and tool.Name ~= "M700" then
-            table.insert(weapons, tool)
+            local priority = autoSwapPriorities[tool.Name] or 100
+            if priority < bestPriority then
+                best = tool
+                bestPriority = priority
+            end
         end
     end
-    table.sort(weapons, function(a, b)
-        return (autoSwapPriorities[a.Name] or 100)
-            < (autoSwapPriorities[b.Name] or 100)
-    end)
-    return weapons[1]
+    return best
 end
 
-local function setAutoSwapEnabled(enabled)
-    State.AutoSwap = enabled == true
-    if autoSwapConnection then
-        autoSwapConnection:Disconnect()
-        autoSwapConnection = nil
+local function tryAutoSwap(tool)
+    if not runtimeAlive or not State.AutoSwap then
+        return
     end
+    local character = LocalPlayer.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local equipped = character and character:FindFirstChildOfClass("Tool")
+    if not humanoid or not equipped or (tool and equipped ~= tool) then
+        return
+    end
+
+    local ammo = equipped:GetAttribute("Local_CurrentAmmo")
+    if ammo == nil then
+        ammo = equipped:GetAttribute("CurrentAmmo")
+    end
+    if type(ammo) ~= "number" or ammo > 0 or os.clock() - autoSwapLastRun < 0.15 then
+        return
+    end
+
+    local replacement = getAutoSwapWeapon()
+    if replacement then
+        autoSwapLastRun = os.clock()
+        pcall(function()
+            humanoid:EquipTool(replacement)
+        end)
+    end
+end
+
+local function bindAutoSwapGun(tool)
+    disconnectAutoSwapList(autoSwapGunConnections)
+    if not State.AutoSwap or not tool or not tool:IsA("Tool") then
+        return
+    end
+
+    for _, attribute in ipairs({"Local_CurrentAmmo", "CurrentAmmo"}) do
+        autoSwapGunConnections[#autoSwapGunConnections + 1] =
+            tool:GetAttributeChangedSignal(attribute):Connect(function()
+                tryAutoSwap(tool)
+            end)
+    end
+    task.defer(function()
+        tryAutoSwap(tool)
+    end)
+end
+
+local function bindAutoSwapCharacter(character)
+    disconnectAutoSwapList(autoSwapConnections)
+    disconnectAutoSwapList(autoSwapGunConnections)
     if not State.AutoSwap then
         return
     end
 
-    autoSwapConnection = RunService.Heartbeat:Connect(function()
-        if not runtimeAlive or not State.AutoSwap then
-            return
+    autoSwapConnections[#autoSwapConnections + 1] = LocalPlayer.CharacterAdded:Connect(function(newCharacter)
+        task.defer(function()
+            if runtimeAlive and State.AutoSwap then
+                bindAutoSwapCharacter(newCharacter)
+            end
+        end)
+    end)
+
+    if not character then
+        return
+    end
+
+    autoSwapConnections[#autoSwapConnections + 1] = character.ChildAdded:Connect(function(object)
+        if object:IsA("Tool") then
+            bindAutoSwapGun(object)
         end
-        local character = LocalPlayer.Character
-        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-        local equipped = character and character:FindFirstChildOfClass("Tool")
-        if not humanoid or not equipped then
-            return
-        end
-        local ammo = equipped:GetAttribute("Local_CurrentAmmo")
-        if ammo == nil then
-            ammo = equipped:GetAttribute("CurrentAmmo")
-        end
-        if type(ammo) ~= "number" or ammo > 0 or os.clock() - autoSwapLastRun < 0.15 then
-            return
-        end
-        local replacement = getAutoSwapWeapon()
-        if replacement then
-            autoSwapLastRun = os.clock()
-            pcall(function()
-                humanoid:EquipTool(replacement)
+    end)
+    autoSwapConnections[#autoSwapConnections + 1] = character.ChildRemoved:Connect(function(object)
+        if object:IsA("Tool") then
+            task.defer(function()
+                if runtimeAlive and State.AutoSwap then
+                    bindAutoSwapGun(character:FindFirstChildOfClass("Tool"))
+                end
             end)
         end
     end)
+    bindAutoSwapGun(character:FindFirstChildOfClass("Tool"))
+end
+
+local function setAutoSwapEnabled(enabled)
+    State.AutoSwap = enabled == true
+    disconnectAutoSwapList(autoSwapConnections)
+    disconnectAutoSwapList(autoSwapGunConnections)
+    if State.AutoSwap then
+        bindAutoSwapCharacter(LocalPlayer.Character)
+    end
 end
 
 local PhysicsService = game:GetService("PhysicsService")
 local noclipConnection
 local noclipExtraConnections = {}
-local noclipPartConnections = {}
-local noclipSavedCollisions = {}
+local noclipPartConnections = setmetatable({}, {__mode = "k"})
+local noclipSavedCollisions = setmetatable({}, {__mode = "k"})
 local NoclipGroup = "ConsistGhost"
 local noclipGroupReady = false
 local noclipGroupAttempted = false
 local maxZoomSaved
 local starterMaxZoomSaved
-local antiSeatConnection
+local antiSeatConnections = {}
 local antiSeatHumanoid
 local antiSeatStateEnabled
 local jumpConnection
@@ -821,6 +1007,7 @@ local jumpHumanoid
 local jumpStateEnabled
 local jumpBaseline
 local jumpLastFire = 0
+local jumpAccumulator = 0
 local antiAfkConnection
 local riotConnection
 local riotSaved = setmetatable({}, {__mode = "k"})
@@ -829,11 +1016,6 @@ local pickupItems = setmetatable({}, {__mode = "k"})
 local pickupGeneration = 0
 local fenceSaved = setmetatable({}, {__mode = "k"})
 local fenceConnection
-local spinConnection
-local spinHumanoid
-local spinSavedAutoRotate
-local spinMover
-local spinRoot
 
 local function disconnectNoclipConnection(connection)
     if connection then
@@ -945,6 +1127,27 @@ local function bindNoclipPart(part)
     noclipPartConnections[part] = partConnections
 end
 
+local function unbindNoclipPart(part, restore)
+    local partConnections = noclipPartConnections[part]
+    if partConnections then
+        for _, connection in ipairs(partConnections) do
+            disconnectNoclipConnection(connection)
+        end
+        noclipPartConnections[part] = nil
+    end
+
+    local saved = noclipSavedCollisions[part]
+    if restore and saved and part and part.Parent then
+        pcall(function()
+            part.CanCollide = saved.CanCollide
+        end)
+        pcall(function()
+            part.CollisionGroup = saved.CollisionGroup
+        end)
+    end
+    noclipSavedCollisions[part] = nil
+end
+
 local function forceCharacterNoclip(character)
     if not character then
         return
@@ -978,7 +1181,7 @@ local function stopNoclip()
 end
 
 local function startNoclip()
-    if noclipConnection and State.Noclip then
+    if State.Noclip then
         return
     end
     disconnectNoclipRuntimeConnections()
@@ -999,24 +1202,34 @@ local function startNoclip()
                 end)
             end
         end))
+        table.insert(noclipExtraConnections, character.DescendantRemoving:Connect(function(descendant)
+            if State.Noclip and descendant:IsA("BasePart") then
+                unbindNoclipPart(descendant, true)
+            end
+        end))
     end
 
-    local function enforceNoclip()
-        if State.Noclip then
-            forceCharacterNoclip(LocalPlayer.Character)
+    -- Keep the cached character parts non-collidable during physics. This only
+    -- walks the small tracked character-part set; it does not rescan descendants.
+    noclipConnection = RunService.PreSimulation:Connect(function()
+        if not State.Noclip then
+            return
         end
-    end
-
-    local physicsSignal = RunService.Stepped
-    pcall(function()
-        if RunService.PreSimulation then
-            physicsSignal = RunService.PreSimulation
+        for part in pairs(noclipSavedCollisions) do
+            if part and part.Parent then
+                if part.CanCollide then
+                    pcall(function()
+                        part.CanCollide = false
+                    end)
+                end
+                if noclipGroupReady and part.CollisionGroup ~= NoclipGroup then
+                    pcall(function()
+                        part.CollisionGroup = NoclipGroup
+                    end)
+                end
+            end
         end
     end)
-    noclipConnection = physicsSignal:Connect(enforceNoclip)
-    if physicsSignal ~= RunService.Stepped then
-        table.insert(noclipExtraConnections, RunService.Stepped:Connect(enforceNoclip))
-    end
 end
 
 local function setNoclipEnabled(enabled)
@@ -1062,51 +1275,67 @@ local function bindAntiSeatHumanoid(humanoid)
     end)
 end
 
-local function setAntiSeatEnabled(enabled)
-    State.AntiSeat = enabled == true
-
-    if antiSeatConnection then
-        antiSeatConnection:Disconnect()
-        antiSeatConnection = nil
+local function disconnectAntiSeatConnections()
+    for _, connection in ipairs(antiSeatConnections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
     end
+    table.clear(antiSeatConnections)
+end
 
-    restoreAntiSeatHumanoid()
+local function ejectAntiSeatHumanoid(humanoid)
+    if not State.AntiSeat or humanoid ~= antiSeatHumanoid or not humanoid.Parent then
+        return
+    end
+    pcall(function()
+        humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, false)
+        if humanoid.Sit
+            or humanoid.SeatPart ~= nil
+            or humanoid:GetState() == Enum.HumanoidStateType.Seated then
+            humanoid.Sit = false
+            humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+        end
+    end)
+end
 
-    if not State.AntiSeat then
+local function bindAntiSeatRuntime(humanoid)
+    disconnectAntiSeatConnections()
+    bindAntiSeatHumanoid(humanoid)
+    if not humanoid or not State.AntiSeat then
         return
     end
 
-    antiSeatConnection = RunService.Heartbeat:Connect(function()
-        if not runtimeAlive or not State.AntiSeat then
-            return
-        end
-
-        local character = LocalPlayer.Character
-        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-
-        if humanoid ~= antiSeatHumanoid then
-            bindAntiSeatHumanoid(humanoid)
-        end
-
-        if not humanoid then
-            return
-        end
-
-        pcall(function()
-            humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, false)
-        end)
-
-        local seated = humanoid.Sit
-            or humanoid.SeatPart ~= nil
-            or humanoid:GetState() == Enum.HumanoidStateType.Seated
-
-        if seated then
-            pcall(function()
-                humanoid.Sit = false
-                humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
-            end)
+    -- Seat prevention is event-driven. There is no reason to poll the humanoid
+    -- 20 times per second when Roblox already exposes each relevant change.
+    antiSeatConnections[#antiSeatConnections + 1] = humanoid.Seated:Connect(function(active)
+        if active then
+            task.defer(ejectAntiSeatHumanoid, humanoid)
         end
     end)
+    antiSeatConnections[#antiSeatConnections + 1] = humanoid:GetPropertyChangedSignal("Sit"):Connect(function()
+        if humanoid.Sit then
+            task.defer(ejectAntiSeatHumanoid, humanoid)
+        end
+    end)
+    antiSeatConnections[#antiSeatConnections + 1] = humanoid.StateChanged:Connect(function(_, newState)
+        if newState == Enum.HumanoidStateType.Seated then
+            task.defer(ejectAntiSeatHumanoid, humanoid)
+        end
+    end)
+
+    ejectAntiSeatHumanoid(humanoid)
+end
+
+local function setAntiSeatEnabled(enabled)
+    State.AntiSeat = enabled == true
+    disconnectAntiSeatConnections()
+    restoreAntiSeatHumanoid()
+
+    if State.AntiSeat then
+        local character = LocalPlayer.Character
+        bindAntiSeatRuntime(character and character:FindFirstChildOfClass("Humanoid"))
+    end
 end
 
 local function restoreJumpHumanoid()
@@ -1172,8 +1401,22 @@ local function refreshJumpRuntime()
         return
     end
 
-    jumpConnection = RunService.Heartbeat:Connect(function()
+    jumpAccumulator = 0
+    jumpConnection = RunService.Heartbeat:Connect(function(deltaTime)
         if not runtimeAlive or (not State.Jump and not State.InfJump) then
+            return
+        end
+
+        jumpAccumulator += math.max(deltaTime, 0)
+        if jumpAccumulator < (1 / 60) then
+            return
+        end
+        jumpAccumulator %= (1 / 60)
+
+        -- Idle Jump/Inf Jump should be effectively free. Resolve character state
+        -- only while Space is actually being held.
+        if not UserInputService:IsKeyDown(Enum.KeyCode.Space)
+            or UserInputService:GetFocusedTextBox() then
             return
         end
 
@@ -1183,21 +1426,14 @@ local function refreshJumpRuntime()
             bindJumpHumanoid(humanoid)
         end
 
-        if not humanoid or humanoid.Health <= 0 then
+        if not humanoid or humanoid.Health <= 0 or humanoid.SeatPart or humanoid.Sit then
             return
         end
 
-        -- Keep jumping available even when the game's crouch/state script disables it.
+        -- Only force the Jumping state while the user is actually trying to jump.
         pcall(function()
             humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
         end)
-
-        if not UserInputService:IsKeyDown(Enum.KeyCode.Space)
-            or UserInputService:GetFocusedTextBox()
-            or humanoid.SeatPart
-            or humanoid.Sit then
-            return
-        end
 
         local root = character and character:FindFirstChild("HumanoidRootPart")
         if not root then
@@ -1317,6 +1553,35 @@ local function restoreRiotShields()
     end
 end
 
+local function applyRiotShield(shield)
+    if not State.AntiRiotShield
+        or not shield
+        or not shield:IsA("BasePart")
+        or shield.Name ~= "RiotShieldPart" then
+        return
+    end
+
+    local belongsToOtherPlayer = false
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer
+            and player.Character
+            and shield:IsDescendantOf(player.Character) then
+            belongsToOtherPlayer = true
+            break
+        end
+    end
+    if not belongsToOtherPlayer then
+        return
+    end
+
+    if riotSaved[shield] == nil then
+        riotSaved[shield] = shield.CanQuery
+    end
+    if shield.CanQuery then
+        shield.CanQuery = false
+    end
+end
+
 local function setAntiRiotShieldEnabled(enabled)
     State.AntiRiotShield = enabled == true
     if riotConnection then
@@ -1327,17 +1592,25 @@ local function setAntiRiotShieldEnabled(enabled)
         restoreRiotShields()
         return
     end
-    riotConnection = RunService.Heartbeat:Connect(function()
-        for _, player in ipairs(Players:GetPlayers()) do
-            if player ~= LocalPlayer and player.Character then
-                local shield = player.Character:FindFirstChild("RiotShieldPart", true)
-                if shield and shield:IsA("BasePart") then
-                    if riotSaved[shield] == nil then
-                        riotSaved[shield] = shield.CanQuery
-                    end
-                    shield.CanQuery = false
-                end
+
+    -- Scan once, then react only when a new shield part appears. The previous
+    -- implementation recursively searched every player character every frame.
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character then
+            local shield = player.Character:FindFirstChild("RiotShieldPart", true)
+            if shield then
+                applyRiotShield(shield)
             end
+        end
+    end
+
+    riotConnection = workspace.DescendantAdded:Connect(function(object)
+        if object.Name == "RiotShieldPart" and object:IsA("BasePart") then
+            task.defer(function()
+                if runtimeAlive and State.AntiRiotShield and object.Parent then
+                    applyRiotShield(object)
+                end
+            end)
         end
     end)
 end
@@ -1369,13 +1642,27 @@ local function setAutoPickupEnabled(enabled)
         return
     end
 
-    for _, object in ipairs(workspace:GetDescendants()) do
-        registerPickup(object)
-    end
     table.insert(pickupConnections, workspace.DescendantAdded:Connect(registerPickup))
     table.insert(pickupConnections, workspace.DescendantRemoving:Connect(function(object)
         pickupItems[object] = nil
     end))
+
+    -- Build the initial pickup index incrementally instead of walking the whole
+    -- workspace in one frame.
+    task.spawn(function()
+        local descendants = workspace:GetDescendants()
+        for index, object in ipairs(descendants) do
+            if not runtimeAlive
+                or not State.AutoPickup
+                or generation ~= pickupGeneration then
+                break
+            end
+            registerPickup(object)
+            if index % 100 == 0 then
+                task.wait()
+            end
+        end
+    end)
 
     task.spawn(function()
         while runtimeAlive and State.AutoPickup and generation == pickupGeneration do
@@ -1392,16 +1679,18 @@ local function setAutoPickupEnabled(enabled)
                         if primary
                             and type(toolName) == "string"
                             and not backpack:FindFirstChild(toolName)
-                            and not (character and character:FindFirstChild(toolName))
-                            and (primary.Position - root.Position).Magnitude < 12 then
-                            pcall(function()
-                                giverPressed:FireServer(pickup)
-                            end)
+                            and not (character and character:FindFirstChild(toolName)) then
+                            local delta = primary.Position - root.Position
+                            if delta:Dot(delta) < 144 then
+                                pcall(function()
+                                    giverPressed:FireServer(pickup)
+                                end)
+                            end
                         end
                     end
                 end
             end
-            task.wait(0.05)
+            task.wait(0.10)
         end
     end)
 end
@@ -1449,79 +1738,108 @@ local function setAntiFenceEnabled(enabled)
     end)
 end
 
-local function destroySpinMover()
-    if spinMover then
-        pcall(function()
-            spinMover:Destroy()
-        end)
-        spinMover = nil
+local SpinBot = {
+    Enabled = false,
+    Mode = "BodyMover",
+    Speed = 40,
+    SpinX = false,
+    SpinY = true,
+    SpinZ = false,
+    AngularVelocity = nil,
+    _conn = nil
+}
+
+local function onSpinTick()
+    if not SpinBot.Enabled then return end
+    local char = LocalPlayer.Character
+    if not char then return end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not hum or not root then return end
+
+    if hum.Sit then return end
+
+    if SpinBot.Mode == "RotVelocity" then
+        hum.AutoRotate = false
+        local original = root.AssemblyAngularVelocity
+        root.AssemblyAngularVelocity = Vector3.new(
+            SpinBot.SpinX and SpinBot.Speed or original.X,
+            SpinBot.SpinY and SpinBot.Speed or original.Y,
+            SpinBot.SpinZ and SpinBot.Speed or original.Z
+        )
+    elseif SpinBot.Mode == "CFrame" then
+        hum.AutoRotate = false
+        local val = math.rad((os.clock() * (20 * SpinBot.Speed)) % 360)
+        local x, y, z = root.CFrame:ToOrientation()
+        root.CFrame = CFrame.new(root.Position) * CFrame.Angles(
+            SpinBot.SpinX and val or x,
+            SpinBot.SpinY and val or y,
+            SpinBot.SpinZ and val or z
+        )
+    elseif SpinBot.Mode == "BodyMover" then
+        hum.AutoRotate = false
+        if SpinBot.AngularVelocity and not SpinBot.AngularVelocity.Parent then
+            pcall(function()
+                SpinBot.AngularVelocity:Destroy()
+            end)
+            SpinBot.AngularVelocity = nil
+        end
+        if not SpinBot.AngularVelocity then
+            SpinBot.AngularVelocity = Instance.new("BodyAngularVelocity")
+        end
+        SpinBot.AngularVelocity.Parent = root
+        SpinBot.AngularVelocity.MaxTorque = Vector3.new(
+            SpinBot.SpinX and math.huge or 0,
+            SpinBot.SpinY and math.huge or 0,
+            SpinBot.SpinZ and math.huge or 0
+        )
+        SpinBot.AngularVelocity.AngularVelocity = Vector3.new(
+            SpinBot.Speed,
+            SpinBot.Speed,
+            SpinBot.Speed
+        )
     end
-    spinRoot = nil
 end
 
-local function restoreSpinHumanoid()
-    destroySpinMover()
-    if spinHumanoid and spinHumanoid.Parent then
-        spinHumanoid.AutoRotate = spinSavedAutoRotate == nil and true or spinSavedAutoRotate
+SpinBot.Speed = State.SpinSpeed
+SpinBot._conn = RunService.Heartbeat:Connect(onSpinTick)
+
+function SpinBot:Toggle(state)
+    self.Enabled = state
+    if not state then
+        local char = LocalPlayer.Character
+        if char then
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if hum then
+                hum.AutoRotate = true
+            end
+        end
+        if self.AngularVelocity then
+            self.AngularVelocity:Destroy()
+            self.AngularVelocity = nil
+        end
     end
-    spinHumanoid = nil
-    spinSavedAutoRotate = nil
 end
 
-local function ensureSpinMover(root)
-    if not root or not root.Parent then
-        destroySpinMover()
-        return nil
+function SpinBot:SetMode(mode)
+    self.Mode = mode
+    if self.AngularVelocity then
+        self.AngularVelocity:Destroy()
+        self.AngularVelocity = nil
     end
-    if spinMover and spinMover.Parent == root and spinRoot == root then
-        return spinMover
-    end
+end
 
-    destroySpinMover()
-    local mover = Instance.new("BodyAngularVelocity")
-    mover.Name = "ConsistSpinbotMover"
-    mover.MaxTorque = Vector3.new(0, 1000000000, 0)
-    mover.P = 100000
-    mover.AngularVelocity = Vector3.new(0, math.rad(State.SpinSpeed), 0)
-    mover.Parent = root
-    spinMover = mover
-    spinRoot = root
-    return mover
+function SpinBot:Unload()
+    self:Toggle(false)
+    if self._conn then
+        self._conn:Disconnect()
+        self._conn = nil
+    end
 end
 
 local function setSpinbotEnabled(enabled)
     State.Spinbot = enabled == true
-    if spinConnection then
-        spinConnection:Disconnect()
-        spinConnection = nil
-    end
-    restoreSpinHumanoid()
-    if not State.Spinbot then
-        return
-    end
-
-    spinConnection = RunService.Heartbeat:Connect(function()
-        local character = LocalPlayer.Character
-        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-        local root = character and character:FindFirstChild("HumanoidRootPart")
-
-        if humanoid ~= spinHumanoid then
-            restoreSpinHumanoid()
-            spinHumanoid = humanoid
-            if spinHumanoid then
-                spinSavedAutoRotate = spinHumanoid.AutoRotate
-            end
-        end
-
-        if humanoid then
-            humanoid.AutoRotate = false
-        end
-
-        local mover = ensureSpinMover(root)
-        if mover then
-            mover.AngularVelocity = Vector3.new(0, math.rad(State.SpinSpeed), 0)
-        end
-    end)
+    SpinBot:Toggle(State.Spinbot)
 end
 
 PlayerFeatures.Cleanup = function()
@@ -1535,7 +1853,8 @@ PlayerFeatures.Cleanup = function()
     setAntiRiotShieldEnabled(false)
     setAutoPickupEnabled(false)
     setAntiFenceEnabled(false)
-    setSpinbotEnabled(false)
+    SpinBot:Unload()
+    State.Spinbot = false
 end
 
 PlayerFeatures.SetAutoSwap = setAutoSwapEnabled
@@ -1549,6 +1868,10 @@ PlayerFeatures.SetAntiRiotShield = setAntiRiotShieldEnabled
 PlayerFeatures.SetAutoPickup = setAutoPickupEnabled
 PlayerFeatures.SetAntiFence = setAntiFenceEnabled
 PlayerFeatures.SetSpinbot = setSpinbotEnabled
+PlayerFeatures.SetSpinSpeed = function(value)
+    State.SpinSpeed = math.clamp(math.floor(value + 0.5), 1, 2000)
+    SpinBot.Speed = State.SpinSpeed
+end
 
 connect(LocalPlayer.CharacterAdded, function()
     task.wait(0.25)
@@ -1556,10 +1879,18 @@ connect(LocalPlayer.CharacterAdded, function()
         disconnectNoclipRuntimeConnections()
         disconnectNoclipPartConnections()
         table.clear(noclipSavedCollisions)
+        State.Noclip = false
         startNoclip()
     end
     if State.MaxZoom then
         setMaxZoomEnabled(true)
+    end
+    if State.AntiSeat then
+        local character = LocalPlayer.Character
+        bindAntiSeatRuntime(character and character:FindFirstChildOfClass("Humanoid"))
+    end
+    if State.Spinbot then
+        SpinBot:Toggle(true)
     end
 end)
 end
@@ -1567,36 +1898,86 @@ end
 do
 local activeTweenTP
 local tweenClickConnection
-local walkSpeedConnection
-local walkSpeedHumanoid
-local savedWalkSpeed
-local vFlyEntity = {
-    isAlive = false,
-    character = {},
-}
+local VFlyLibrary = {}
+VFlyLibrary.__index = VFlyLibrary
 
-local function refreshVFlyEntity()
-    local character = LocalPlayer.Character
-    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-    local root = character and character:FindFirstChild("HumanoidRootPart")
+function VFlyLibrary.new()
+    local self = setmetatable({}, VFlyLibrary)
+    self.Players = game:GetService("Players")
+    self.RunService = game:GetService("RunService")
+    self.UserInputService = game:GetService("UserInputService")
+    self.Workspace = game:GetService("Workspace")
+    self.LocalPlayer = self.Players.LocalPlayer
 
-    vFlyEntity.isAlive = humanoid ~= nil
-        and root ~= nil
-        and humanoid.Health > 0
+    self.Connection = nil
+    self.Enabled = false
+    self.Speed = 100 -- Default VFly speed (Prison Life cars are fast)
 
-    vFlyEntity.character.Humanoid = humanoid
-    vFlyEntity.character.RootPart = root
+    return self
 end
 
-local VehicleFly = {
-    Enabled = false,
-    Mode = "CFrame",
-    Speed = State.VFlySpeed,
-    welds = {},
-    up = 0,
-    down = 0,
-    Connections = {},
-}
+function VFlyLibrary:Enable(speed)
+    if self.Enabled then return end
+    self.Enabled = true
+    if speed then self.Speed = speed end
+
+    -- Run on RenderStepped so camera movements are synced perfectly
+    self.Connection = self.RunService.RenderStepped:Connect(function(dt)
+        local char = self.LocalPlayer.Character
+        if not char then return end
+
+        local humanoid = char:FindFirstChildOfClass("Humanoid")
+        local camera = self.Workspace.CurrentCamera
+
+        if not humanoid or not camera then return end
+
+        -- Vape Logic: Check if we are currently sitting in a VehicleSeat
+        local seat = humanoid.SeatPart
+        if not seat then return end -- Only fly if sitting in a car
+
+        local moveDirection = Vector3.new()
+        local lookVector = camera.CFrame.LookVector
+        local rightVector = camera.CFrame.RightVector
+
+        -- Read WASD inputs relative to the camera
+        if self.UserInputService:IsKeyDown(Enum.KeyCode.W) then moveDirection += lookVector end
+        if self.UserInputService:IsKeyDown(Enum.KeyCode.S) then moveDirection -= lookVector end
+        if self.UserInputService:IsKeyDown(Enum.KeyCode.A) then moveDirection -= rightVector end
+        if self.UserInputService:IsKeyDown(Enum.KeyCode.D) then moveDirection += rightVector end
+        if self.UserInputService:IsKeyDown(Enum.KeyCode.Space) then moveDirection += Vector3.new(0, 1, 0) end
+        if self.UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) or self.UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then 
+            moveDirection -= Vector3.new(0, 1, 0) 
+        end
+
+        -- Vape Movement: Teleport the seat (which drags the whole car)
+        if moveDirection.Magnitude > 0 then
+            moveDirection = moveDirection.Unit
+            -- Speed is multiplied by dt * 60 to keep speed consistent across framerates
+            seat.CFrame = seat.CFrame + (moveDirection * (self.Speed * dt * 60))
+        end
+
+        -- Prison Life Physics Bypass: Zero out the car's velocity to prevent flinging/rubberbanding
+        seat.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+        seat.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+    end)
+end
+
+function VFlyLibrary:Disable()
+    self.Enabled = false
+    if self.Connection then
+        self.Connection:Disconnect()
+        self.Connection = nil
+    end
+end
+
+-- == Execution ==
+-- Initialize the library
+local vfly = VFlyLibrary.new()
+
+-- The Consist UI handles the keybind. It intentionally starts unbound.
+
+print("Prison Life VFly executed! Sit in a car and use the Consist V Fly keybind to toggle.")
+print("Controls: WASD to move, Space to go up, Left Shift/Ctrl to go down.")
 
 local function cancelTweenTP()
     if activeTweenTP then
@@ -1699,210 +2080,103 @@ local function setTweenClickEnabled(enabled)
     end)
 end
 
-local function restoreWalkSpeed()
-    if walkSpeedHumanoid and walkSpeedHumanoid.Parent and savedWalkSpeed ~= nil then
-        walkSpeedHumanoid.WalkSpeed = savedWalkSpeed
+local Speed = {
+    Enabled = false,
+    SpeedValue = 16,
+    AutoJump = false,
+    _conn = nil
+}
+
+local function calculateMoveVector()
+    local move = Vector3.zero
+    if UserInputService:IsKeyDown(Enum.KeyCode.W) then move = move + Vector3.new(0, 0, -1) end
+    if UserInputService:IsKeyDown(Enum.KeyCode.S) then move = move + Vector3.new(0, 0, 1) end
+    if UserInputService:IsKeyDown(Enum.KeyCode.A) then move = move + Vector3.new(-1, 0, 0) end
+    if UserInputService:IsKeyDown(Enum.KeyCode.D) then move = move + Vector3.new(1, 0, 0) end
+
+    if move.Magnitude > 0 then
+        move = move.Unit
     end
-    walkSpeedHumanoid = nil
-    savedWalkSpeed = nil
+    return move
 end
 
-local function applyWalkSpeed()
-    local character = LocalPlayer.Character
-    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-    if humanoid ~= walkSpeedHumanoid then
-        restoreWalkSpeed()
-        walkSpeedHumanoid = humanoid
-        if walkSpeedHumanoid then
-            savedWalkSpeed = walkSpeedHumanoid.WalkSpeed
+local function onSpeedRenderStep()
+    if not Speed.Enabled then return end
+
+    local char = LocalPlayer.Character
+    if not char then return end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not hum or not root or hum.Health <= 0 then return end
+
+    if hum:GetState() == Enum.HumanoidStateType.Climbing then return end
+
+    local localMove = calculateMoveVector()
+    if localMove == Vector3.zero then return end
+
+    local currentCamera = workspace.CurrentCamera
+    if not currentCamera then return end
+
+    local camLook = currentCamera.CFrame.LookVector
+    camLook = Vector3.new(camLook.X, 0, camLook.Z)
+    if camLook.Magnitude <= 0 then return end
+    camLook = camLook.Unit
+
+    local camRight = currentCamera.CFrame.RightVector
+    camRight = Vector3.new(camRight.X, 0, camRight.Z)
+    if camRight.Magnitude <= 0 then return end
+    camRight = camRight.Unit
+
+    local worldMove = (camRight * localMove.X) + (camLook * -localMove.Z)
+    if worldMove.Magnitude > 0 then
+        worldMove = worldMove.Unit
+    end
+
+    local vel = root.AssemblyLinearVelocity
+    root.AssemblyLinearVelocity = Vector3.new(
+        worldMove.X * Speed.SpeedValue,
+        vel.Y,
+        worldMove.Z * Speed.SpeedValue
+    )
+
+    if Speed.AutoJump and hum.FloorMaterial ~= Enum.Material.Air then
+        hum:ChangeState(Enum.HumanoidStateType.Jumping)
+    end
+end
+
+function Speed:Toggle(state)
+    self.Enabled = state
+    if state then
+        if not self._conn then
+            self._conn = RunService.RenderStepped:Connect(onSpeedRenderStep)
+        end
+    else
+        if self._conn then
+            self._conn:Disconnect()
+            self._conn = nil
         end
     end
-    if humanoid then
-        humanoid.WalkSpeed = State.WalkSpeed
-    end
+end
+
+local function refreshSpeedRuntime()
+    Speed.SpeedValue = State.WalkSpeed
+    Speed.AutoJump = State.AutoBhop
+    Speed:Toggle(State.WalkSpeed ~= 16 or State.AutoBhop)
 end
 
 local function setWalkSpeed(value)
-    State.WalkSpeed = math.clamp(math.floor(value + 0.5), 16, 32)
-
-    if State.WalkSpeed == 16 then
-        if walkSpeedConnection then
-            walkSpeedConnection:Disconnect()
-            walkSpeedConnection = nil
-        end
-        restoreWalkSpeed()
-        return
-    end
-
-    applyWalkSpeed()
-    if not walkSpeedConnection then
-        walkSpeedConnection = RunService.Heartbeat:Connect(function()
-            if runtimeAlive and State.WalkSpeed ~= 16 then
-                applyWalkSpeed()
-            end
-        end)
-    end
+    State.WalkSpeed = math.clamp(math.floor(value + 0.5), 16, 33)
+    refreshSpeedRuntime()
 end
 
-function VehicleFly:Clean(object)
-    table.insert(self.Connections, object)
-end
-
-function VehicleFly:Enable()
-    self.Enabled = true
-    self.up, self.down = 0, 0
-
-    self:Clean(UserInputService.InputBegan:Connect(function(input)
-        if not UserInputService:GetFocusedTextBox() then
-            if input.KeyCode == Enum.KeyCode.Space then
-                self.up = 1
-            elseif input.KeyCode == Enum.KeyCode.LeftControl then
-                self.down = -1
-            end
-        end
-    end))
-
-    self:Clean(UserInputService.InputEnded:Connect(function(input)
-        if not UserInputService:GetFocusedTextBox() then
-            if input.KeyCode == Enum.KeyCode.Space then
-                self.up = 0
-            elseif input.KeyCode == Enum.KeyCode.LeftControl then
-                self.down = 0
-            end
-        end
-    end))
-
-    if self.Mode == "Part" then
-        local part = Instance.new("Part")
-        part.Size = Vector3.new(50, 1, 50)
-        part.Anchored = true
-        part.CanQuery = false
-        part.Transparency = 1
-
-        self:Clean(part)
-
-        self:Clean(task.spawn(function()
-            while self.Enabled do
-                refreshVFlyEntity()
-                local seat = vFlyEntity.isAlive
-                    and vFlyEntity.character.Humanoid
-                    and vFlyEntity.character.Humanoid.SeatPart
-                if seat then
-                    part.CFrame = CFrame.new(
-                        seat.Position - Vector3.new(0, 2.2 - (self.up + self.down), 0)
-                    )
-                    part.Parent = workspace
-                else
-                    part.Parent = nil
-                end
-
-                task.wait(0.05)
-            end
-        end))
-    else
-        local inCar = false
-        local old
-
-        self:Clean(RunService.PreSimulation:Connect(function(dt)
-            refreshVFlyEntity()
-
-            local seat = vFlyEntity.isAlive
-                and vFlyEntity.character.Humanoid
-                and vFlyEntity.character.Humanoid.SeatPart
-            local root = seat and vFlyEntity.character.RootPart
-
-            if root then
-                if seat ~= old then
-                    local carContainer = workspace:FindFirstChild("CarContainer")
-                    inCar = carContainer
-                        and seat:IsDescendantOf(carContainer)
-                        and seat:IsA("VehicleSeat")
-
-                    if inCar then
-                        table.clear(self.welds)
-                        local car = seat.Parent and seat.Parent.Parent
-                        if car then
-                            local wheels = car:FindFirstChild("Wheels")
-                            if wheels then
-                                for _, v in wheels:GetDescendants() do
-                                    if v.Name == "Rotate" then
-                                        local success = pcall(function()
-                                            v.Enabled = false
-                                        end)
-                                        if success then
-                                            table.insert(self.welds, v)
-                                        end
-                                    end
-                                end
-                            end
-                        end
-                    end
-
-                    old = seat
-                end
-
-                if inCar then
-                    local currentCamera = workspace.CurrentCamera
-                    if not currentCamera then
-                        return
-                    end
-
-                    root.AssemblyLinearVelocity = Vector3.new(0, 2.25, 0)
-                    root.CFrame = CFrame.lookAlong(
-                        root.Position,
-                        currentCamera.CFrame.LookVector
-                    ) + (
-                        vFlyEntity.character.Humanoid.MoveDirection
-                        + Vector3.new(0, self.up + self.down, 0)
-                    ) * self.Speed * dt
-                    currentCamera.CameraSubject = vFlyEntity.character.Humanoid
-                end
-            elseif old then
-                for _, weld in self.welds do
-                    pcall(function()
-                        weld.Enabled = true
-                    end)
-                end
-                table.clear(self.welds)
-                old = nil
-            end
-        end))
-    end
-end
-
-function VehicleFly:Disable()
-    self.Enabled = false
-
-    for _, v in self.Connections do
-        if typeof(v) == "RBXScriptConnection" then
-            v:Disconnect()
-        elseif typeof(v) == "Instance" then
-            v:Destroy()
-        elseif typeof(v) == "thread" then
-            task.cancel(v)
-        end
-    end
-    table.clear(self.Connections)
-
-    for _, weld in self.welds do
-        pcall(function()
-            weld.Enabled = true
-        end)
-    end
-    table.clear(self.welds)
-end
-
-function VehicleFly:Toggle()
-    if self.Enabled then
-        self:Disable()
-    else
-        self:Enable()
-    end
+local function setAutoBhopEnabled(enabled)
+    State.AutoBhop = enabled == true
+    refreshSpeedRuntime()
 end
 
 local function setVFlySpeed(value)
     State.VFlySpeed = math.clamp(math.floor(value + 0.5), 5, 90)
-    VehicleFly.Speed = State.VFlySpeed
+    vfly.Speed = State.VFlySpeed
 end
 
 local function setVFlyEnabled(enabled)
@@ -1910,12 +2184,11 @@ local function setVFlyEnabled(enabled)
     State.VFly = enabled
 
     if enabled then
-        if not VehicleFly.Enabled then
-            VehicleFly.Speed = State.VFlySpeed
-            VehicleFly:Enable()
+        if not vfly.Enabled then
+            vfly:Enable(State.VFlySpeed)
         end
-    elseif VehicleFly.Enabled then
-        VehicleFly:Disable()
+    elseif vfly.Enabled then
+        vfly:Disable()
     end
 end
 
@@ -1945,6 +2218,7 @@ MovementFeatures.SetTweenSpeed = function(value)
     State.TweenSpeed = math.clamp(math.floor(value + 0.5), 5, 140)
 end
 MovementFeatures.SetWalkSpeed = setWalkSpeed
+MovementFeatures.SetAutoBhop = setAutoBhopEnabled
 MovementFeatures.SetVFly = setVFlyEnabled
 MovementFeatures.SetVFlyBind = function(binding)
     State.VFlyBind = binding
@@ -1953,11 +2227,10 @@ MovementFeatures.SetVFlySpeed = setVFlySpeed
 MovementFeatures.Cleanup = function()
     setTweenClickEnabled(false)
     setVFlyEnabled(false)
-    if walkSpeedConnection then
-        walkSpeedConnection:Disconnect()
-        walkSpeedConnection = nil
-    end
-    restoreWalkSpeed()
+    State.WalkSpeed = 16
+    State.AutoBhop = false
+    Speed.AutoJump = false
+    Speed:Toggle(false)
 end
 end
 
@@ -1994,6 +2267,8 @@ local function getAngularSky()
 end
 
 local fogSaved
+local fogStartConnection
+local fogEndConnection
 local atmosphereSaved = setmetatable({}, {__mode = "k"})
 local blurSaved = setmetatable({}, {__mode = "k"})
 local textureSaved = {}
@@ -2002,10 +2277,12 @@ local textureGeneration = 0
 local lightingConnection
 local longShadowBaseClock
 local shadowSavedGlobal
+local shadowEnforceConnection
 local motionBlurEffect
 local bloomEffect
 local realisticColorEffect
 local motionBlurConnection
+local motionBlurAccumulator = 0
 local lastMotionCameraCFrame
 local motionBlurCurrent = 0
 local bloomTransitionGeneration = 0
@@ -2017,6 +2294,7 @@ local smoothClockTarget = Lighting.ClockTime
 local smoothClockRendered = Lighting.ClockTime
 local smoothClockInternalWrite = false
 local smoothClockConnection
+local smoothClockAccumulator = 0
 local smoothClockChangedConnection
 local smoothClockDriver = {
     Source = Lighting.ClockTime,
@@ -2103,6 +2381,16 @@ end
 
 local function setNoFogEnabled(enabled)
     State.NoFog = enabled == true
+
+    if fogStartConnection then
+        fogStartConnection:Disconnect()
+        fogStartConnection = nil
+    end
+    if fogEndConnection then
+        fogEndConnection:Disconnect()
+        fogEndConnection = nil
+    end
+
     if State.NoFog then
         if not fogSaved then
             fogSaved = {
@@ -2112,6 +2400,20 @@ local function setNoFogEnabled(enabled)
         end
         Lighting.FogStart = 1000000
         Lighting.FogEnd = 1000001
+
+        -- Reassert only when the game actually changes these values. The old
+        -- implementation rewrote both Lighting properties every rendered frame.
+        fogStartConnection = Lighting:GetPropertyChangedSignal("FogStart"):Connect(function()
+            if State.NoFog and Lighting.FogStart ~= 1000000 then
+                Lighting.FogStart = 1000000
+            end
+        end)
+        fogEndConnection = Lighting:GetPropertyChangedSignal("FogEnd"):Connect(function()
+            if State.NoFog and Lighting.FogEnd ~= 1000001 then
+                Lighting.FogEnd = 1000001
+            end
+        end)
+
         for _, object in ipairs(Lighting:GetDescendants()) do
             if object:IsA("Atmosphere") then
                 applyNoFogAtmosphere(object)
@@ -2185,8 +2487,19 @@ local function setDisableShadowsEnabled(enabled)
     end
     State.DisableShadows = nextState
 
+    if shadowEnforceConnection then
+        shadowEnforceConnection:Disconnect()
+        shadowEnforceConnection = nil
+    end
+
     if State.DisableShadows then
         Lighting.GlobalShadows = false
+        -- Property-change enforcement replaces an unconditional per-frame write.
+        shadowEnforceConnection = Lighting:GetPropertyChangedSignal("GlobalShadows"):Connect(function()
+            if State.DisableShadows and Lighting.GlobalShadows then
+                Lighting.GlobalShadows = false
+            end
+        end)
         if State.LongShadows and applyLongShadows then
             applyLongShadows()
         end
@@ -2255,17 +2568,16 @@ local function restoreTextureObjects()
     textureSaved = {}
 
     for object, saved in pairs(savedObjects) do
-        if object and object.Parent then
+        if object and object.Parent and object:IsA("BasePart") then
+            pcall(function()
+                object.MaterialVariant = saved.MaterialVariant or ""
+            end)
             pcall(function()
                 object.Material = saved.Material
             end)
-            if saved.MaterialVariant ~= nil then
-                pcall(function()
-                    object.MaterialVariant = saved.MaterialVariant
-                end)
-            end
         end
     end
+    table.clear(savedObjects)
 end
 
 local function setDisableTexturesEnabled(enabled)
@@ -2294,7 +2606,7 @@ local function setDisableTexturesEnabled(enabled)
             if object:IsA("BasePart") then
                 pcall(saveTextureObject, object, generation)
             end
-            if index % 500 == 0 then
+            if index % 100 == 0 then
                 task.wait()
             end
         end
@@ -2676,10 +2988,16 @@ end)
 
 smoothClockConnection = RunService.RenderStepped:Connect(function(deltaTime)
     if not runtimeAlive or not State.SmoothTransitions then
+        smoothClockAccumulator = 0
         return
     end
 
-    local dt = math.max(deltaTime, 0)
+    smoothClockAccumulator += math.max(deltaTime, 0)
+    if smoothClockAccumulator < (1 / 60) then
+        return
+    end
+    local dt = smoothClockAccumulator
+    smoothClockAccumulator %= (1 / 60)
     if smoothClockDriver.HasVelocity then
         smoothClockDriver.Source =
             (smoothClockDriver.Source + smoothClockDriver.Velocity * dt) % 24
@@ -2722,13 +3040,22 @@ lightingConnection = Lighting.DescendantAdded:Connect(function(object)
 end)
 
 motionBlurConnection = RunService.RenderStepped:Connect(function(deltaTime)
-    if State.NoFog then
-        Lighting.FogStart = 1000000
-        Lighting.FogEnd = 1000001
+    local needsFrameWork = (State.LongShadows and not State.DisableShadows and not State.SmoothTransitions)
+        or (State.MotionBlur and not State.NoBlur)
+
+    if not needsFrameWork then
+        motionBlurAccumulator = 0
+        lastMotionCameraCFrame = nil
+        return
     end
-    if State.DisableShadows then
-        Lighting.GlobalShadows = false
+
+    motionBlurAccumulator += math.max(deltaTime, 0)
+    if motionBlurAccumulator < (1 / 60) then
+        return
     end
+    deltaTime = motionBlurAccumulator
+    motionBlurAccumulator %= (1 / 60)
+
     if State.LongShadows and not State.SmoothTransitions then
         applyLongShadows()
     end
@@ -2900,17 +3227,44 @@ local function installExternalKeybind(control, initialValue, onSelected)
     return api
 end
 
+local aimPartResolutionCache = setmetatable({}, {__mode = "k"})
+
 local function resolveAimPart(character, selection)
     if not character then
         return nil
     end
-    for _, partName in ipairs(AimPartAliases[selection] or {selection}) do
-        local part = character:FindFirstChild(partName)
+
+    local cache = aimPartResolutionCache[character]
+    if not cache then
+        cache = {}
+        aimPartResolutionCache[character] = cache
+    end
+
+    local cached = cache[selection]
+    if cached and cached.Parent == character then
+        return cached
+    end
+
+    local aliases = AimPartAliases[selection]
+    if aliases then
+        for _, partName in ipairs(aliases) do
+            local part = character:FindFirstChild(partName)
+            if part and part:IsA("BasePart") then
+                cache[selection] = part
+                return part
+            end
+        end
+    else
+        local part = character:FindFirstChild(selection)
         if part and part:IsA("BasePart") then
+            cache[selection] = part
             return part
         end
     end
-    return character:FindFirstChild("HumanoidRootPart")
+
+    local root = character:FindFirstChild("HumanoidRootPart")
+    cache[selection] = root
+    return root
 end
 
 local function isModeActive(modeName)
@@ -2923,6 +3277,9 @@ local function clearTargets()
     camTarget = nil
     mouseTarget = nil
     table.clear(adaptivePartCache)
+    if wallBSetEnabled then
+        wallBSetEnabled(State.WallB)
+    end
 end
 
 local function teamIsExcluded(player)
@@ -2931,15 +3288,52 @@ local function teamIsExcluded(player)
         and State.ExcludedTeams[player.Team.Name] == true
 end
 
+local TargetRuntime = {
+    CharacterCache = setmetatable({}, {__mode = "k"}),
+    VisibilityCache = setmetatable({}, {__mode = "k"}),
+    VisibilityParams = RaycastParams.new(),
+    VisibilityIgnore = {},
+    VisibilityCharacter = nil,
+    SilentPlayer = nil,
+    SilentPart = nil,
+    SilentAt = 0,
+    SilentX = 0,
+    SilentY = 0,
+}
+TargetRuntime.VisibilityParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function getTargetCharacterParts(player)
+    local character = player and player.Character
+    if not character then
+        return nil, nil, nil
+    end
+
+    local cached = TargetRuntime.CharacterCache[player]
+    if not cached or cached.Character ~= character then
+        cached = {
+            Character = character,
+            Humanoid = character:FindFirstChildOfClass("Humanoid"),
+            Root = character:FindFirstChild("HumanoidRootPart"),
+        }
+        TargetRuntime.CharacterCache[player] = cached
+    else
+        if not cached.Humanoid or cached.Humanoid.Parent ~= character then
+            cached.Humanoid = character:FindFirstChildOfClass("Humanoid")
+        end
+        if not cached.Root or cached.Root.Parent ~= character then
+            cached.Root = character:FindFirstChild("HumanoidRootPart")
+        end
+    end
+
+    return cached.Character, cached.Humanoid, cached.Root
+end
+
 local function validTarget(player)
-    if not player or player == LocalPlayer or not player.Character then
+    if not player or player == LocalPlayer then
         return false
     end
-    local humanoid = player.Character:FindFirstChildOfClass("Humanoid")
-    if not humanoid or (State.DeadCheck and humanoid.Health <= 0) then
-        return false
-    end
-    if not player.Character:FindFirstChild("HumanoidRootPart") then
+    local _, humanoid, root = getTargetCharacterParts(player)
+    if not humanoid or not root or (State.DeadCheck and humanoid.Health <= 0) then
         return false
     end
     return not teamIsExcluded(player)
@@ -2950,15 +3344,31 @@ local function partVisible(part)
     if not camera or not part then
         return false
     end
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances = LocalPlayer.Character and {LocalPlayer.Character} or {}
+
+    local now = os.clock()
+    local cached = TargetRuntime.VisibilityCache[part]
+    if cached and now - cached.Time < (1 / 120) then
+        return cached.Visible
+    end
+
+    local localCharacter = LocalPlayer.Character
+    if TargetRuntime.VisibilityCharacter ~= localCharacter then
+        TargetRuntime.VisibilityCharacter = localCharacter
+        table.clear(TargetRuntime.VisibilityIgnore)
+        if localCharacter then
+            TargetRuntime.VisibilityIgnore[1] = localCharacter
+        end
+        TargetRuntime.VisibilityParams.FilterDescendantsInstances = TargetRuntime.VisibilityIgnore
+    end
+
     local result = workspace:Raycast(
         camera.CFrame.Position,
         part.Position - camera.CFrame.Position,
-        params
+        TargetRuntime.VisibilityParams
     )
-    return result == nil or result.Instance:IsDescendantOf(part.Parent)
+    local visible = result == nil or result.Instance:IsDescendantOf(part.Parent)
+    TargetRuntime.VisibilityCache[part] = {Time = now, Visible = visible}
+    return visible
 end
 
 local AdaptiveSelections = {
@@ -2970,6 +3380,34 @@ local AdaptiveSelections = {
     "LeftLeg",
     "RightLeg",
 }
+
+local adaptiveCandidatesCache = setmetatable({}, {__mode = "k"})
+
+local function getAdaptiveCandidates(character)
+    local cached = adaptiveCandidatesCache[character]
+    if cached then
+        local valid = true
+        for _, part in ipairs(cached) do
+            if not part or part.Parent ~= character then
+                valid = false
+                break
+            end
+        end
+        if valid then
+            return cached
+        end
+    end
+
+    local candidates = table.create(#AdaptiveSelections)
+    for _, selection in ipairs(AdaptiveSelections) do
+        local part = resolveAimPart(character, selection)
+        if part and not table.find(candidates, part) then
+            candidates[#candidates + 1] = part
+        end
+    end
+    adaptiveCandidatesCache[character] = candidates
+    return candidates
+end
 
 local function getAimPart(character, screenAnchor, ignoreWallCheck)
     if not State.AdaptiveAim then
@@ -2984,25 +3422,22 @@ local function getAimPart(character, screenAnchor, ignoreWallCheck)
     local bestScore = math.huge
     local currentPart = adaptivePartCache[character]
     local currentScore = math.huge
-    local seen = {}
 
-    for _, selection in ipairs(AdaptiveSelections) do
-        local part = resolveAimPart(character, selection)
-        if part and not seen[part] then
-            seen[part] = true
-            local point, onScreen = camera:WorldToViewportPoint(part.Position)
-            if onScreen and point.Z > 0 then
-                local score = (Vector2.new(point.X, point.Y) - screenAnchor).Magnitude
-                if State.WallCheck and not ignoreWallCheck and not partVisible(part) then
-                    score += 100000
-                end
-                if score < bestScore then
-                    bestScore = score
-                    bestPart = part
-                end
-                if part == currentPart then
-                    currentScore = score
-                end
+    for _, part in ipairs(getAdaptiveCandidates(character)) do
+        local point, onScreen = camera:WorldToViewportPoint(part.Position)
+        if onScreen and point.Z > 0 then
+            local dx = point.X - screenAnchor.X
+            local dy = point.Y - screenAnchor.Y
+            local score = math.sqrt(dx * dx + dy * dy)
+            if State.WallCheck and not ignoreWallCheck and not partVisible(part) then
+                score += 100000
+            end
+            if score < bestScore then
+                bestScore = score
+                bestPart = part
+            end
+            if part == currentPart then
+                currentScore = score
             end
         end
     end
@@ -3020,6 +3455,26 @@ local function getAimPart(character, screenAnchor, ignoreWallCheck)
     return selected
 end
 
+local targetPlayerList = {}
+for _, player in ipairs(Players:GetPlayers()) do
+    if player ~= LocalPlayer then
+        targetPlayerList[#targetPlayerList + 1] = player
+    end
+end
+
+connect(Players.PlayerAdded, function(player)
+    if player ~= LocalPlayer then
+        targetPlayerList[#targetPlayerList + 1] = player
+    end
+end)
+
+connect(Players.PlayerRemoving, function(player)
+    local index = table.find(targetPlayerList, player)
+    if index then
+        table.remove(targetPlayerList, index)
+    end
+end)
+
 local function findTarget(screenAnchor, ignoreWallCheck)
     camera = workspace.CurrentCamera
     if not camera then
@@ -3028,17 +3483,19 @@ local function findTarget(screenAnchor, ignoreWallCheck)
 
     local bestPlayer
     local bestPart
-    local bestDistance = State.FovRadius
+    local bestDistanceSquared = State.FovRadius * State.FovRadius
 
-    for _, player in ipairs(Players:GetPlayers()) do
+    for _, player in ipairs(targetPlayerList) do
         if validTarget(player) then
             local part = getAimPart(player.Character, screenAnchor, ignoreWallCheck)
             if part and (ignoreWallCheck or not State.WallCheck or partVisible(part)) then
                 local point, onScreen = camera:WorldToViewportPoint(part.Position)
                 if onScreen and point.Z > 0 then
-                    local distance = (Vector2.new(point.X, point.Y) - screenAnchor).Magnitude
-                    if distance < bestDistance then
-                        bestDistance = distance
+                    local dx = point.X - screenAnchor.X
+                    local dy = point.Y - screenAnchor.Y
+                    local distanceSquared = dx * dx + dy * dy
+                    if distanceSquared < bestDistanceSquared then
+                        bestDistanceSquared = distanceSquared
                         bestPlayer = player
                         bestPart = part
                     end
@@ -3050,12 +3507,34 @@ local function findTarget(screenAnchor, ignoreWallCheck)
     return bestPlayer, bestPart
 end
 
+local function findSilentTarget(screenAnchor)
+    local now = os.clock()
+    if TargetRuntime.SilentPlayer
+        and validTarget(TargetRuntime.SilentPlayer)
+        and TargetRuntime.SilentPart
+        and TargetRuntime.SilentPart.Parent
+        and now - TargetRuntime.SilentAt < (1 / 60)
+        and math.abs(screenAnchor.X - TargetRuntime.SilentX) <= 2
+        and math.abs(screenAnchor.Y - TargetRuntime.SilentY) <= 2 then
+        return TargetRuntime.SilentPlayer, TargetRuntime.SilentPart
+    end
+
+    local player, part = findTarget(screenAnchor, false)
+    TargetRuntime.SilentPlayer = player
+    TargetRuntime.SilentPart = part
+    TargetRuntime.SilentAt = now
+    TargetRuntime.SilentX = screenAnchor.X
+    TargetRuntime.SilentY = screenAnchor.Y
+    return player, part
+end
+
 local setTriggerBEnabled
 do
 local triggerBConnection
 local triggerBLastShot = 0
 local triggerBLastGun
 local triggerBPressed = false
+local triggerBAccumulator = 0
 
 local triggerMousePress
 local triggerMouseRelease
@@ -3085,16 +3564,11 @@ end
 
 local function getEquippedTriggerGun()
     local character = LocalPlayer.Character
-    if not character then
-        return nil
-    end
-
-    for _, object in ipairs(character:GetChildren()) do
-        if object:IsA("Tool")
-            and (object:GetAttribute("ToolType") == "Gun"
-                or object:GetAttribute("FireRate") ~= nil) then
-            return object
-        end
+    local object = character and character:FindFirstChildOfClass("Tool")
+    if object
+        and (object:GetAttribute("ToolType") == "Gun"
+            or object:GetAttribute("FireRate") ~= nil) then
+        return object
     end
     return nil
 end
@@ -3134,7 +3608,10 @@ local function triggerBTarget()
     end
 
     if selected == "Silent" then
-        return findTarget(mousePosition, State.WallB)
+        if State.WallB then
+            return findTarget(mousePosition, true)
+        end
+        return findSilentTarget(mousePosition)
     end
 
     return nil, nil
@@ -3239,17 +3716,19 @@ setTriggerBEnabled = function(enabled)
         return
     end
 
-    triggerBConnection = RunService.RenderStepped:Connect(function()
+    triggerBAccumulator = 0
+    triggerBConnection = RunService.Heartbeat:Connect(function(deltaTime)
         if not runtimeAlive or not State.TriggerB then
             return
         end
 
-        local targetPlayer, targetPart = triggerBTarget()
-        if not targetPlayer or not targetPart then
-            stopTriggerBGun()
+        triggerBAccumulator += math.max(deltaTime, 0)
+        if triggerBAccumulator < (1 / 60) then
             return
         end
+        triggerBAccumulator %= (1 / 60)
 
+        -- Do not run target acquisition at all unless there is a gun to fire.
         local gun = getEquippedTriggerGun()
         if not gun then
             stopTriggerBGun()
@@ -3273,6 +3752,14 @@ setTriggerBEnabled = function(enabled)
 
         local now = os.clock()
         if now - triggerBLastShot < fireRate then
+            return
+        end
+
+        -- Target acquisition is the expensive part. Only do it on frames where
+        -- the weapon is actually ready to fire instead of rescanning every frame.
+        local targetPlayer, targetPart = triggerBTarget()
+        if not targetPlayer or not targetPart then
+            stopTriggerBGun()
             return
         end
 
@@ -3400,27 +3887,29 @@ local function makeTitledSection(page, side, title)
 end
 
 local lastSectionTitleTheme = Consist:GetTheme()
-connect(RunService.Heartbeat, function()
-    local currentTheme = Consist:GetTheme()
-    if currentTheme == lastSectionTitleTheme then
-        return
-    end
-    lastSectionTitleTheme = currentTheme
-    local color = SectionTitleColors[currentTheme] or SectionTitleColors.Dark
-    local strokeColor = SectionStrokeColors[currentTheme] or SectionStrokeColors.Dark
-    for _, titleLabel in ipairs(sectionTitleLabels) do
-        if titleLabel.Parent then
-            titleLabel.TextColor3 = color
+task.spawn(function()
+    while runtimeAlive do
+        local currentTheme = Consist:GetTheme()
+        if currentTheme ~= lastSectionTitleTheme then
+            lastSectionTitleTheme = currentTheme
+            local color = SectionTitleColors[currentTheme] or SectionTitleColors.Dark
+            local strokeColor = SectionStrokeColors[currentTheme] or SectionStrokeColors.Dark
+            for _, titleLabel in ipairs(sectionTitleLabels) do
+                if titleLabel.Parent then
+                    titleLabel.TextColor3 = color
+                end
+            end
+            for _, sectionStroke in ipairs(sectionStrokes) do
+                if sectionStroke.Parent then
+                    sectionStroke.Color = strokeColor
+                    sectionStroke.Transparency = 0
+                end
+            end
+            if compactModeDots and compactModeDots.Parent then
+                compactModeDots.TextColor3 = color
+            end
         end
-    end
-    for _, sectionStroke in ipairs(sectionStrokes) do
-        if sectionStroke.Parent then
-            sectionStroke.Color = strokeColor
-            sectionStroke.Transparency = 0
-        end
-    end
-    if compactModeDots and compactModeDots.Parent then
-        compactModeDots.TextColor3 = color
+        task.wait(0.20)
     end
 end)
 
@@ -3937,6 +4426,10 @@ rememberToggle(WallBSection:Toggle({
     Default = false,
     Callback = function(value)
         State.WallB = value
+        if wallBSetEnabled then
+            wallBSetEnabled(value)
+        end
+        clearTargets()
     end,
 }))
 
@@ -3949,173 +4442,20 @@ rememberToggle(WallBSection:Toggle({
 }))
 
 rememberToggle(WallBSection:Toggle({
-    Name = "Trigger Bot",
+    Name = "Trigger B",
     Default = false,
     Callback = function(value)
         setTriggerBEnabled(value)
     end,
 }))
 
-local setFastShootExpanded
-local fastShootMinimum = 0.01
-local fastShootMaximum = 0.20
-local fastShootStockRate = 0.05
-local fastShootCurrentRate = fastShootStockRate
-local fastShootSliderControl
-local fastShootSliderUpdate
-
 rememberToggle(WallBSection:Toggle({
     Name = "Fast Shoot",
     Default = false,
     Callback = function(value)
         setFastShootEnabled(value)
-        if setFastShootExpanded then
-            setFastShootExpanded(value)
-        end
     end,
 }))
-
-fastShootSliderControl = WallBSection:Slider({
-    Name = "Fire Rate",
-    Minimum = fastShootMinimum,
-    Maximum = fastShootMaximum,
-    Default = fastShootStockRate,
-    Decimals = 3,
-    Callback = function(value)
-        local rate = math.clamp(value, fastShootMinimum, fastShootMaximum)
-        rate = math.floor(rate * 1000 + 0.5) / 1000
-        if math.abs(rate - fastShootStockRate) <= 0.006 then
-            rate = fastShootStockRate
-        end
-        fastShootCurrentRate = rate
-        State.FastShootRate = rate
-        if fastShootSliderControl and math.abs(fastShootSliderControl:Get() - rate) > 0.0004 then
-            fastShootSliderControl:Set(rate, true)
-        end
-        if fastShootSliderUpdate then
-            fastShootSliderUpdate(rate)
-        end
-        if State.FastShoot then
-            refreshFastShootGuns()
-            local gun = getEquippedFastShootGun()
-            if gun then
-                pcall(function()
-                    gun:Deactivate()
-                end)
-                applyFastShootGun(gun)
-                task.defer(function()
-                    if runtimeAlive and State.FastShoot and gun.Parent then
-                        applyFastShootGun(gun)
-                        if fastShootMouseHeld then
-                            pcall(function()
-                                gun:Activate()
-                            end)
-                        end
-                    end
-                end)
-            end
-        end
-    end,
-})
-
-local fastShootSliderHolder = fastShootSliderControl.Instance
-local fastShootTrack
-local fastShootValueLabel
-for _, child in ipairs(fastShootSliderHolder:GetChildren()) do
-    if child:IsA("Frame")
-        and child.Position.Y.Offset == 27
-        and child.Size.Y.Offset == 3 then
-        fastShootTrack = child
-    elseif child:IsA("TextLabel") and child.AnchorPoint.X == 1 then
-        fastShootValueLabel = child
-    end
-end
-
-assert(fastShootTrack and fastShootValueLabel, "Consist fire-rate slider visuals were not found")
-
-local fastShootFill
-for _, child in ipairs(fastShootTrack:GetChildren()) do
-    if child:IsA("Frame")
-        and child.AnchorPoint.X == 0
-        and child.Size.Y.Scale == 1 then
-        fastShootFill = child
-        break
-    end
-end
-assert(fastShootFill, "Consist fire-rate slider fill was not found")
-
-local stockRateAlpha = (fastShootStockRate - fastShootMinimum)
-    / (fastShootMaximum - fastShootMinimum)
-local stockRateMarker = Instance.new("Frame")
-stockRateMarker.Name = "StockRateMarker"
-stockRateMarker.AnchorPoint = Vector2.new(0.5, 0.5)
-stockRateMarker.Position = UDim2.new(stockRateAlpha, 0, 0.5, 0)
-stockRateMarker.Size = UDim2.fromOffset(2, 7)
-stockRateMarker.BackgroundColor3 = fastShootTrack.BackgroundColor3
-stockRateMarker.BorderSizePixel = 0
-stockRateMarker.ZIndex = 6
-stockRateMarker.Parent = fastShootTrack
-
-local function fireRateColor(rate)
-    local red = Color3.fromRGB(232, 70, 76)
-    local yellow = Color3.fromRGB(235, 190, 68)
-    local green = Color3.fromRGB(72, 198, 112)
-    if rate < fastShootStockRate then
-        local alpha = (rate - fastShootMinimum)
-            / math.max(0.001, fastShootStockRate - fastShootMinimum)
-        return red:Lerp(yellow, math.clamp(alpha, 0, 1))
-    elseif rate > fastShootStockRate then
-        return yellow:Lerp(
-            green,
-            math.clamp(
-                (rate - fastShootStockRate)
-                    / math.max(0.001, fastShootMaximum - fastShootStockRate),
-                0,
-                1
-            )
-        )
-    end
-    return yellow
-end
-
-local fastShootSliderColor = fireRateColor(fastShootCurrentRate)
-fastShootSliderUpdate = function(rate)
-    fastShootSliderColor = fireRateColor(rate)
-    fastShootValueLabel.Text = rate < 0.1
-        and string.format("%.3fs", rate)
-        or string.format("%.2fs", rate)
-    fastShootFill.BackgroundColor3 = fastShootSliderColor
-end
-
-fastShootSliderUpdate(fastShootCurrentRate)
-connect(RunService.Heartbeat, function()
-    if runtimeAlive and fastShootFill.Parent then
-        fastShootFill.BackgroundColor3 = fastShootSliderColor
-        stockRateMarker.BackgroundColor3 = fastShootTrack.BackgroundColor3
-    end
-end)
-
-local expandedWallBHeight = WallBSection.ContentHeight
-local fastShootSliderHeight = 44
-local collapsedWallBHeight = expandedWallBHeight - fastShootSliderHeight
-local fastShootSliderSeparator
-for _, child in ipairs(WallBSection.Frame:GetChildren()) do
-    if child:IsA("Frame")
-        and child.Size.Y.Offset == 1
-        and child.Position.Y.Offset == collapsedWallBHeight - 1 then
-        fastShootSliderSeparator = child
-        break
-    end
-end
-
-fastShootSliderControl:SetVisible(false)
-if fastShootSliderSeparator then
-    fastShootSliderSeparator.Visible = false
-end
-WallBSection.ContentHeight = collapsedWallBHeight
-WallBSection.Frame.Size = UDim2.fromOffset(258, collapsedWallBHeight)
-WallBSection.Shadow.Size = UDim2.fromOffset(258, collapsedWallBHeight)
-Combat.Layout.Right = WallBSection.Y + collapsedWallBHeight + 10
 
 local ChecksSection = makeTitledSection(Combat, "Right", "Checks")
 rememberToggle(ChecksSection:Toggle({
@@ -4237,38 +4577,6 @@ local function refreshRightSectionLayout()
     Combat.Frame.CanvasSize = UDim2.fromOffset(0, math.max(Combat.Layout.Left, bottom))
 end
 
-setFastShootExpanded = function(expanded)
-    fastShootLayoutExtra = expanded and fastShootSliderHeight or 0
-    if expanded then
-        fastShootSliderControl:SetVisible(true)
-    end
-    if fastShootSliderSeparator then
-        fastShootSliderSeparator.Visible = expanded
-    end
-
-    local targetHeight = collapsedWallBHeight + fastShootLayoutExtra
-    WallBSection.ContentHeight = targetHeight
-    TweenService:Create(
-        WallBSection.Frame,
-        TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-        {Size = UDim2.fromOffset(258, targetHeight)}
-    ):Play()
-    TweenService:Create(
-        WallBSection.Shadow,
-        TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-        {Size = UDim2.fromOffset(258, targetHeight)}
-    ):Play()
-    refreshRightSectionLayout()
-
-    if not expanded then
-        task.delay(0.18, function()
-            if runtimeAlive and not State.FastShoot then
-                fastShootSliderControl:SetVisible(false)
-            end
-        end)
-    end
-end
-
 setAdaptiveExpanded = function(expanded)
     local extra = expanded and 44 or 0
     adaptiveLayoutExtra = extra
@@ -4359,26 +4667,42 @@ connect(UserInputService.InputEnded, function(input)
         heldMode = nil
     end
 
-    if input.UserInputType ~= Enum.UserInputType.MouseButton1
-        and input.UserInputType ~= Enum.UserInputType.MouseButton2
-        and input.UserInputType ~= Enum.UserInputType.MouseButton3
-        and input.UserInputType ~= Enum.UserInputType.Keyboard then
+    local mouseRelease = input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.MouseButton2
+        or input.UserInputType == Enum.UserInputType.MouseButton3
+
+    -- Only refresh toggle visuals after an actual UI click. The old version
+    -- scheduled three full toggle refreshes after every keyboard/mouse release,
+    -- including gunfire, which created a lot of needless tasks and UI writes.
+    if not mouseRelease or not inputIsOverApp(input) then
         return
     end
 
     accentRefreshToken += 1
     local token = accentRefreshToken
-    for _, delayTime in ipairs({0.06, 0.35, 0.75}) do
-        task.delay(delayTime, function()
-            if runtimeAlive and token == accentRefreshToken then
-                refreshEnabledToggleColors()
-            end
-        end)
-    end
+    task.delay(0.05, function()
+        if runtimeAlive and token == accentRefreshToken then
+            refreshEnabledToggleColors()
+        end
+    end)
 end)
 
 connect(RunService.RenderStepped, function()
     if not runtimeAlive then
+        return
+    end
+
+    local camActive = isModeActive("Camlock")
+    local mouseActive = isModeActive("Mouselock")
+    local selectedActive = isModeActive(State.SelectedMode)
+    local fovVisible = State.FovEnabled and (not State.FovAimOnly or selectedActive)
+
+    if not camActive and not mouseActive and not fovVisible then
+        if fovCircle and fovCircle.Visible then
+            fovCircle.Visible = false
+        end
+        camTarget = nil
+        mouseTarget = nil
         return
     end
 
@@ -4387,19 +4711,25 @@ connect(RunService.RenderStepped, function()
         return
     end
 
-    local mousePosition = UserInputService:GetMouseLocation()
     local screenCenter = camera.ViewportSize / 2
-    local fovCenter = State.SelectedMode == "Camlock" and screenCenter or mousePosition
-
-    if fovCircle then
-        local diameter = State.FovRadius * 2
-        fovCircle.Position = UDim2.fromOffset(fovCenter.X, fovCenter.Y)
-        fovCircle.Size = UDim2.fromOffset(diameter, diameter)
-        fovCircle.Visible = State.FovEnabled
-            and (not State.FovAimOnly or isModeActive(State.SelectedMode))
+    local mousePosition
+    if mouseActive or (fovVisible and State.SelectedMode ~= "Camlock") then
+        mousePosition = UserInputService:GetMouseLocation()
     end
 
-    if isModeActive("Camlock") then
+    if fovCircle then
+        if fovVisible then
+            local fovCenter = State.SelectedMode == "Camlock" and screenCenter or mousePosition
+            local diameter = State.FovRadius * 2
+            fovCircle.Position = UDim2.fromOffset(fovCenter.X, fovCenter.Y)
+            fovCircle.Size = UDim2.fromOffset(diameter, diameter)
+            fovCircle.Visible = true
+        elseif fovCircle.Visible then
+            fovCircle.Visible = false
+        end
+    end
+
+    if camActive then
         if not validTarget(camTarget) then
             camTarget = nil
         end
@@ -4427,7 +4757,7 @@ connect(RunService.RenderStepped, function()
         camTarget = nil
     end
 
-    if isModeActive("Mouselock") then
+    if mouseActive then
         if not validTarget(mouseTarget) then
             mouseTarget = nil
         end
@@ -4463,271 +4793,8 @@ connect(RunService.RenderStepped, function()
     end
 end)
 
-if false then
-local ScanRadius = 6
-local TargetExpand = 7.4
-local HugDistance = 7.5
-local OriginScanner = {Cache = {}}
-local scanOffsets = {
-    Vector3.new(0, 1, 0),
-    Vector3.new(1, 0, 0),
-    Vector3.new(0.7, -0.5, -0.5),
-    Vector3.new(-0.1, -0.8, -0.8),
-    Vector3.new(-0.8, -0.5, -0.5),
-    Vector3.new(-1, 0, 0),
-    Vector3.new(-0.8, 0.4, 0.4),
-    Vector3.new(0, 0.7, 0.7),
-    Vector3.new(0.7, 0.5, 0.5),
-    Vector3.new(0.7, 0, -0.8),
-    Vector3.new(-0.1, 0, -1),
-    Vector3.new(-0.8, 0, -0.8),
-    Vector3.new(-0.8, 0, 0.7),
-    Vector3.new(0, 0, 1),
-    Vector3.new(0.7, 0, 0.7),
-    Vector3.new(0.7, 0.4, -0.5),
-    Vector3.new(-0.1, 0.7, -0.8),
-    Vector3.new(-1, -0.1, 0),
-    Vector3.new(-0.8, -0.5, 0.4),
-    Vector3.new(0, -0.8, 0.7),
-    Vector3.new(0.7, -0.6, 0.5),
-    Vector3.new(0, -1, 0),
-}
-
-local normalOffsets = {}
-for _, normal in ipairs(Enum.NormalId:GetEnumItems()) do
-    table.insert(normalOffsets, Vector3.fromNormalId(normal))
-end
-
-local bulletRayParams = RaycastParams.new()
-local bulletOverlapParams = OverlapParams.new()
-bulletRayParams.FilterType = Enum.RaycastFilterType.Exclude
-bulletOverlapParams.FilterType = Enum.RaycastFilterType.Exclude
-pcall(function()
-    bulletRayParams.CollisionGroup = "ClientBullet"
-    bulletOverlapParams.CollisionGroup = "ClientBullet"
-end)
-
-local function updateBulletIgnore()
-    local ignored = {}
-    for _, player in ipairs(Players:GetPlayers()) do
-        if player.Character then
-            table.insert(ignored, player.Character)
-        end
-    end
-    bulletRayParams.FilterDescendantsInstances = ignored
-    bulletOverlapParams.FilterDescendantsInstances = ignored
-end
-
-local function pointIsOpen(position)
-    local parts = workspace:GetPartBoundsInRadius(position, 0, bulletOverlapParams)
-    for _, part in ipairs(parts) do
-        if part.CanCollide
-            and (part:GetClosestPointOnSurface(position) - position).Magnitude <= 0.0001 then
-            return false
-        end
-    end
-    return true
-end
-
-function OriginScanner:Find(origin, target, extra, targetPart, targetCharacter)
-    if self.Cache[targetPart] then
-        return table.unpack(self.Cache[targetPart])
-    end
-
-    local targetPositions = {}
-    if pointIsOpen(target) then
-        if extra and (origin - extra).Magnitude < HugDistance then
-            self.Cache[targetPart] = {extra}
-            return extra
-        end
-        table.insert(targetPositions, target)
-    end
-
-    local targetRoot = targetCharacter and targetCharacter:FindFirstChild("HumanoidRootPart")
-    if targetRoot then
-        for _, offset in ipairs(normalOffsets) do
-            local position = targetRoot.Position + offset * TargetExpand
-            if pointIsOpen(position) then
-                table.insert(targetPositions, position)
-            end
-        end
-        for _, offset in ipairs(scanOffsets) do
-            local position = targetRoot.Position + offset * (TargetExpand * 0.5)
-            if pointIsOpen(position) then
-                table.insert(targetPositions, position)
-            end
-        end
-    end
-
-    local originPositions = {origin}
-    for _, multiplier in ipairs({1, 1.75}) do
-        for _, offset in ipairs(scanOffsets) do
-            local position = origin + offset * (ScanRadius * multiplier)
-            if pointIsOpen(position) then
-                table.insert(originPositions, position)
-            end
-        end
-    end
-
-    for _, hitboxPosition in ipairs(targetPositions) do
-        for _, originPosition in ipairs(originPositions) do
-            local ray = workspace:Raycast(
-                hitboxPosition,
-                originPosition - hitboxPosition,
-                bulletRayParams
-            )
-            if not ray then
-                self.Cache[targetPart] = {originPosition, hitboxPosition}
-                return originPosition, hitboxPosition
-            end
-        end
-    end
-
-    return nil, nil
-end
-
-connect(RunService.RenderStepped, function()
-    table.clear(OriginScanner.Cache)
-end)
-
-local gunFunctions = {}
-local oldBullet
-
-local function findGunFunctions()
-    if type(getconnections) ~= "function"
-        or not debug
-        or type(debug.getupvalue) ~= "function"
-        or type(debug.info) ~= "function" then
-        return
-    end
-
-    local home = LocalPlayer.PlayerGui:FindFirstChild("Home")
-    local hud = home and home:FindFirstChild("hud")
-    local actionArea = hud and hud:FindFirstChild("ActionArea")
-    if actionArea then
-        for _, connection in ipairs(getconnections(actionArea.InputBegan)) do
-            if connection.Function then
-                gunFunctions.Shoot = debug.getupvalue(connection.Function, 2)
-                if gunFunctions.Shoot then
-                    gunFunctions.Bullet = debug.getupvalue(gunFunctions.Shoot, 16)
-                    if gunFunctions.Bullet then
-                        break
-                    end
-                end
-            end
-        end
-    end
-end
-
-local function silentBulletHook(...)
-    if not oldBullet then
-        return nil
-    end
-    if not runtimeAlive or not isModeActive("Silent") then
-        return oldBullet(...)
-    end
-
-    local args = table.pack(...)
-    local origin = args[1]
-    if typeof(origin) ~= "Vector3" then
-        return oldBullet(...)
-    end
-
-    local targetPlayer, targetPart = findTarget(
-        UserInputService:GetMouseLocation(),
-        State.WallB
-    )
-    if not targetPlayer or not targetPart then
-        return oldBullet(...)
-    end
-
-    args[2] = predictedPosition(targetPart) or targetPart.Position
-
-    if not State.WallB then
-        return oldBullet(table.unpack(args, 1, args.n))
-    end
-
-    updateBulletIgnore()
-    local reverseRay = workspace:Raycast(
-        args[2],
-        origin - args[2],
-        bulletRayParams
-    )
-    local forwardRay = workspace:Raycast(
-        origin,
-        args[2] - origin,
-        bulletRayParams
-    )
-
-    if OriginScanner.Cache[targetPart] or reverseRay or forwardRay then
-        local localRoot = LocalPlayer.Character
-            and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-        local newOrigin, hitPosition
-        if localRoot then
-            newOrigin, hitPosition = OriginScanner:Find(
-                localRoot.Position,
-                args[2],
-                reverseRay and reverseRay.Position + reverseRay.Normal * 0.01 or nil,
-                targetPart,
-                targetPlayer.Character
-            )
-        end
-
-        if newOrigin then
-            if debug
-                and type(debug.getstack) == "function"
-                and type(debug.setstack) == "function" then
-                pcall(function()
-                    local stack = debug.getstack(3)
-                    if stack then
-                        for index, value in ipairs(stack) do
-                            if value == origin then
-                                debug.setstack(3, index, newOrigin)
-                            end
-                        end
-                    end
-                end)
-            end
-            args[1] = newOrigin
-            if hitPosition then
-                return targetPart, hitPosition
-            end
-        else
-            return targetPart, targetPart.Position
-        end
-    end
-
-    return oldBullet(table.unpack(args, 1, args.n))
-end
-
--- Bullet redirection is installed once by the shared Silent/WallB hook below.
--- Keeping a single hook avoids WallB replacing normal Silent at runtime.
-end
-
-local basicSilentOldIndex
-pcall(function()
-    if type(hookmetamethod) == "function" and type(newcclosure) == "function" then
-        basicSilentOldIndex = hookmetamethod(game, "__index", newcclosure(function(object, key)
-            if runtimeAlive
-                and isModeActive("Silent")
-                and not State.WallB
-                and object == mouse
-                and (key == "Hit" or key == "Target") then
-                local _, part = findTarget(UserInputService:GetMouseLocation())
-                if part then
-                    if key == "Target" then
-                        return part
-                    end
-                    local predicted = predictedPosition(part)
-                    if predicted then
-                        return CFrame.new(predicted)
-                    end
-                end
-            end
-            return basicSilentOldIndex(object, key)
-        end))
-    end
-end)
+-- Normal Silent and Wall Bang share the bullet hook below. Avoiding a global
+-- __index hook keeps Silent from adding overhead to every property lookup in the game.
 
 do
 local SETTINGS = {
@@ -5320,7 +5387,6 @@ end
 
 local gun = {}
 local oldBullet
-local wallBCacheConnection
 
 local function findGunInternals()
     local gui = localPlayer.PlayerGui:WaitForChild("Home", 10)
@@ -5412,7 +5478,7 @@ local function wallBBulletHook(...)
     -- Normal Silent: redirect the shot to the selected aim part without
     -- enabling any of WallB's origin scanning / through-wall behavior.
     if not State.WallB then
-        local _, targetPart = findTarget(UserInputService:GetMouseLocation(), false)
+        local _, targetPart = findSilentTarget(UserInputService:GetMouseLocation())
         if not targetPart then
             return oldBullet(...)
         end
@@ -5421,8 +5487,10 @@ local function wallBBulletHook(...)
         return oldBullet(table.unpack(args, 1, args.n))
     end
 
-    -- WallB keeps its stronger origin scanning path, but it now shares this
-    -- same hook instead of replacing the normal Silent hook.
+    -- Wall Bang keeps its stronger origin scanning path. The origin cache only
+    -- needs to live for this one shot; clearing it here removes the old
+    -- RenderStepped cache-maintenance loop entirely.
+    table.clear(OriginScanner.Cache)
     SETTINGS.Range = State.FovRadius
     SETTINGS.TeamCheck = State.TeamCheck
 
@@ -5485,8 +5553,24 @@ local function wallBBulletHook(...)
     return oldBullet(table.unpack(args, 1, args.n))
 end
 
-entitylib.start()
+wallBSetEnabled = function(enabled)
+    SETTINGS.Enabled = enabled == true
+    local shouldRun = SETTINGS.Enabled and isModeActive("Silent")
 
+    if shouldRun then
+        if not entitylib.Running then
+            entitylib.start()
+        end
+        OriginScanner:UpdateIgnore()
+    else
+        table.clear(OriginScanner.Cache)
+        if entitylib.Running then
+            entitylib.stop()
+        end
+    end
+end
+
+local wallBHookTarget
 task.spawn(function()
     findGunInternals()
     local attempts = 0
@@ -5500,28 +5584,36 @@ task.spawn(function()
         return
     end
 
-    OriginScanner:UpdateIgnore()
     for _, eventName in ipairs({"EntityAdded", "LocalAdded"}) do
         entitylib.Events[eventName]:Connect(function()
-            OriginScanner:UpdateIgnore()
+            if State.WallB then
+                OriginScanner:UpdateIgnore()
+            end
         end)
     end
 
-    wallBCacheConnection = runService.RenderStepped:Connect(function()
-        table.clear(OriginScanner.Cache)
-    end)
-
+    wallBHookTarget = gun.Bullet
     oldBullet = hookFunction(gun.Bullet, wallBBulletHook)
+
+    if State.WallB then
+        wallBSetEnabled(true)
+    end
 end)
 
 wallBCleanup = function()
-    if wallBCacheConnection then
-        wallBCacheConnection:Disconnect()
-        wallBCacheConnection = nil
-    end
     if entitylib.Running then
         entitylib.stop()
     end
+    table.clear(OriginScanner.Cache)
+
+    -- Restore the original bullet function on re-execution so repeated Consist
+    -- test runs do not stack permanent hook wrappers.
+    if wallBHookTarget and oldBullet and type(hookFunction) == "function" then
+        pcall(function()
+            hookFunction(wallBHookTarget, oldBullet)
+        end)
+    end
+    wallBHookTarget = nil
 end
 
 wallBRefreshTeams = function()
@@ -5542,7 +5634,7 @@ local ESP = {
     TeamCheckEnabled = false,
     TeamColorEnabled = false,
     NameEnabled = false,
-    DisplayNameEnabled = false,
+    DisplayNameEnabled = true,
     ItemEnabled = false,
     HostileEnabled = false,
     ForcefieldEnabled = false,
@@ -5568,7 +5660,6 @@ local edges3D = {
 }
 
 local espFont = Enum.Font.RobotoMono
-
 local espGui = priorityOverlayGui
 
 local espRoot = Instance.new("Frame")
@@ -5579,208 +5670,21 @@ espRoot.BorderSizePixel = 0
 espRoot.ZIndex = 1
 espRoot.Parent = espGui
 
-local function guiTransparency(value)
-    return 1 - math.clamp(tonumber(value) or 1, 0, 1)
-end
-
-local function newDrawing(drawingType, properties)
-    local state = {}
-    local object
-    local outline
-
-    if drawingType == "Text" then
-        object = Instance.new("TextLabel")
-        object.AutomaticSize = Enum.AutomaticSize.XY
-        object.Size = UDim2.fromOffset(0, 0)
-        object.AnchorPoint = Vector2.new(0.5, 0.5)
-        object.BackgroundTransparency = 1
-        object.BorderSizePixel = 0
-        object.Font = espFont
-        pcall(function()
-            object.FontFace = Font.new(
-                Font.fromEnum(espFont).Family,
-                Enum.FontWeight.SemiBold,
-                Enum.FontStyle.Normal
-            )
-        end)
-        object.TextWrapped = false
-        object.RichText = false
-    else
-        object = Instance.new("Frame")
-        object.BorderSizePixel = 0
-        if drawingType == "Line" then
-            object.AnchorPoint = Vector2.new(0.5, 0.5)
-        else
-            outline = Instance.new("UIStroke")
-            outline.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-            outline.Parent = object
-        end
-    end
-
-    object.Name = drawingType
-    object.Visible = false
-    object.ZIndex = 1
-    object.Parent = espRoot
-
-    local function refreshLineGeometry()
-        local from = state.From or Vector2.zero
-        local to = state.To or from
-        local delta = to - from
-        local midpoint = from + delta * 0.5
-        object.Position = UDim2.fromOffset(midpoint.X, midpoint.Y)
-        object.Size = UDim2.fromOffset(delta.Magnitude, state.Thickness or 1)
-        object.Rotation = math.deg(math.atan2(delta.Y, delta.X))
-    end
-
-    local function refreshTextStroke()
-        object.TextStrokeTransparency = state.Outline == true
-            and math.clamp(guiTransparency(state.Transparency) + 0.15, 0, 1)
-            or 1
-    end
-
-    local function refreshAll()
-        if drawingType == "Line" then
-            refreshLineGeometry()
-            object.BackgroundColor3 = state.Color or Color3.new(1, 1, 1)
-            object.BackgroundTransparency = guiTransparency(state.Transparency)
-        elseif drawingType == "Square" then
-            local position = state.Position or Vector2.zero
-            local size = typeof(state.Size) == "Vector2" and state.Size or Vector2.zero
-            local filled = state.Filled == true
-            object.Position = UDim2.fromOffset(position.X, position.Y)
-            object.Size = UDim2.fromOffset(math.max(0, size.X), math.max(0, size.Y))
-            object.BackgroundColor3 = state.Color or Color3.new(1, 1, 1)
-            object.BackgroundTransparency = filled and guiTransparency(state.Transparency) or 1
-            outline.Enabled = not filled
-            outline.Color = state.Color or Color3.new(1, 1, 1)
-            outline.Thickness = state.Thickness or 1
-            outline.Transparency = guiTransparency(state.Transparency)
-        else
-            local position = state.Position or Vector2.zero
-            object.AnchorPoint = state.Center == false and Vector2.zero or Vector2.new(0.5, 0.5)
-            object.Position = UDim2.fromOffset(position.X, position.Y)
-            object.Text = tostring(state.Text or "")
-            object.TextSize = tonumber(state.Size) or 13
-            object.TextColor3 = state.Color or Color3.new(1, 1, 1)
-            object.TextTransparency = guiTransparency(state.Transparency)
-            object.TextStrokeColor3 = state.OutlineColor or Color3.new()
-            refreshTextStroke()
-        end
-        object.Visible = state.Visible == true
-        object.ZIndex = math.max(1, tonumber(state.ZIndex) or 1)
-    end
-
-    local function applyProperty(key)
-        if drawingType == "Line" then
-            if key == "From" or key == "To" or key == "Thickness" then
-                refreshLineGeometry()
-            elseif key == "Color" then
-                object.BackgroundColor3 = state.Color or Color3.new(1, 1, 1)
-            elseif key == "Transparency" then
-                object.BackgroundTransparency = guiTransparency(state.Transparency)
-            elseif key == "Visible" then
-                object.Visible = state.Visible == true
-            elseif key == "ZIndex" then
-                object.ZIndex = math.max(1, tonumber(state.ZIndex) or 1)
-            end
-            return
-        end
-
-        if drawingType == "Square" then
-            if key == "Position" then
-                local position = state.Position or Vector2.zero
-                object.Position = UDim2.fromOffset(position.X, position.Y)
-            elseif key == "Size" then
-                local size = typeof(state.Size) == "Vector2" and state.Size or Vector2.zero
-                object.Size = UDim2.fromOffset(math.max(0, size.X), math.max(0, size.Y))
-            elseif key == "Color" then
-                local color = state.Color or Color3.new(1, 1, 1)
-                object.BackgroundColor3 = color
-                outline.Color = color
-            elseif key == "Filled" then
-                local filled = state.Filled == true
-                object.BackgroundTransparency = filled and guiTransparency(state.Transparency) or 1
-                outline.Enabled = not filled
-            elseif key == "Transparency" then
-                local transparency = guiTransparency(state.Transparency)
-                object.BackgroundTransparency = state.Filled == true and transparency or 1
-                outline.Transparency = transparency
-            elseif key == "Thickness" then
-                outline.Thickness = state.Thickness or 1
-            elseif key == "Visible" then
-                object.Visible = state.Visible == true
-            elseif key == "ZIndex" then
-                object.ZIndex = math.max(1, tonumber(state.ZIndex) or 1)
-            end
-            return
-        end
-
-        if key == "Position" then
-            local position = state.Position or Vector2.zero
-            object.Position = UDim2.fromOffset(position.X, position.Y)
-        elseif key == "Center" then
-            object.AnchorPoint = state.Center == false and Vector2.zero or Vector2.new(0.5, 0.5)
-        elseif key == "Text" then
-            object.Text = tostring(state.Text or "")
-        elseif key == "Size" then
-            object.TextSize = tonumber(state.Size) or 13
-        elseif key == "Color" then
-            object.TextColor3 = state.Color or Color3.new(1, 1, 1)
-        elseif key == "Transparency" then
-            object.TextTransparency = guiTransparency(state.Transparency)
-            refreshTextStroke()
-        elseif key == "Outline" then
-            refreshTextStroke()
-        elseif key == "OutlineColor" then
-            object.TextStrokeColor3 = state.OutlineColor or Color3.new()
-        elseif key == "Visible" then
-            object.Visible = state.Visible == true
-        elseif key == "ZIndex" then
-            object.ZIndex = math.max(1, tonumber(state.ZIndex) or 1)
-        end
-    end
-
-    local proxy = setmetatable({}, {
-        __index = function(_, key)
-            if key == "_GuiDrawing" then
-                return true
-            elseif key == "Instance" then
-                return object
-            elseif key == "TextBounds" and drawingType == "Text" then
-                return object and object.TextBounds or Vector2.zero
-            elseif key == "Remove" then
-                return function()
-                    if object then
-                        object:Destroy()
-                        object = nil
-                    end
-                end
-            end
-            return state[key]
-        end,
-        __newindex = function(_, key, value)
-            if state[key] == value then
-                return
-            end
-            state[key] = value
-            if object then
-                applyProperty(key)
-            end
-        end,
-    })
-
-    for property, value in pairs(properties or {}) do
-        state[property] = value
-    end
-    state.Visible = false
-    refreshAll()
-    return proxy
-end
-
 local healthFull = Color3.fromRGB(55, 255, 90)
 local healthYellow = Color3.fromRGB(190, 255, 55)
 local healthOrange = Color3.fromRGB(255, 175, 45)
 local healthRed = Color3.fromRGB(255, 65, 65)
+local black = Color3.new(0, 0, 0)
+local drawState = setmetatable({}, {__mode = "k"})
+
+local function getDrawState(object)
+    local state = drawState[object]
+    if not state then
+        state = {}
+        drawState[object] = state
+    end
+    return state
+end
 
 local function lerpColor(first, second, alpha)
     return Color3.new(
@@ -5805,300 +5709,576 @@ local function healthColor(alpha)
     return healthRed
 end
 
-local function createESPDrawings()
-    local set = {
-        Box = newDrawing("Square", {
-            Color = ESP.BoxColor,
-            Thickness = 1.5,
-            Filled = false,
-            Transparency = 1,
-        }),
-        BoxOutline = newDrawing("Square", {
-            Color = Color3.new(),
-            Thickness = 1.5,
-            Filled = false,
-            Transparency = 0.5,
-        }),
-        BoxFill = newDrawing("Square", {
-            Color = ESP.BoxFillColor,
-            Thickness = 1,
-            Filled = true,
-            Transparency = 0.6,
-        }),
-        NameText = newDrawing("Text", {
-            Color = ESP.TextColor,
-            Size = 14,
-            Center = true,
-            Outline = true,
-            OutlineColor = Color3.new(),
-            Font = espFont,
-            Transparency = 1,
-        }),
-        HostileText = newDrawing("Text", {
-            Color = healthRed,
-            Size = 13,
-            Center = true,
-            Outline = true,
-            OutlineColor = Color3.new(),
-            Font = espFont,
-            Transparency = 1,
-        }),
-        ForcefieldText = newDrawing("Text", {
-            Color = healthOrange,
-            Size = 13,
-            Center = true,
-            Outline = true,
-            OutlineColor = Color3.new(),
-            Font = espFont,
-            Transparency = 1,
-        }),
-        ItemText = newDrawing("Text", {
-            Color = ESP.TextColor,
-            Size = 13,
-            Center = true,
-            Outline = true,
-            OutlineColor = Color3.new(),
-            Font = espFont,
-            Transparency = 1,
-        }),
-        TeamText = newDrawing("Text", {
-            Color = ESP.TextColor,
-            Size = 13,
-            Center = true,
-            Outline = true,
-            OutlineColor = Color3.new(),
-            Font = espFont,
-            Transparency = 1,
-        }),
-        DistanceText = newDrawing("Text", {
-            Color = ESP.TextColor,
-            Size = 13,
-            Center = true,
-            Outline = true,
-            OutlineColor = Color3.new(),
-            Font = espFont,
-            Transparency = 1,
-        }),
-        HealthBarOutline = newDrawing("Square", {
-            Color = Color3.new(),
-            Thickness = 1,
-            Filled = true,
-            Transparency = 1,
-        }),
-        HealthBarBack = newDrawing("Square", {
-            Color = Color3.new(),
-            Thickness = 1,
-            Filled = true,
-            Transparency = 1,
-        }),
-        HealthBarFill = newDrawing("Square", {
-            Color = healthFull,
-            Thickness = 1,
-            Filled = true,
-            Transparency = 1,
-        }),
-        HealthText = newDrawing("Text", {
-            Color = ESP.TextColor,
-            Size = 13,
-            Center = true,
-            Outline = true,
-            OutlineColor = Color3.new(),
-            Font = espFont,
-            Transparency = 1,
-        }),
-        BodyTracer = newDrawing("Line", {
-            Color = ESP.TracerColor,
-            Thickness = 1.5,
-            Transparency = 1,
-        }),
-        TracerMouse = newDrawing("Line", {
-            Color = ESP.TracerColor,
-            Thickness = 1.5,
-            Transparency = 1,
-        }),
-        TracerTop = newDrawing("Line", {
-            Color = ESP.TracerColor,
-            Thickness = 1.5,
-            Transparency = 1,
-        }),
-        TracerBottom = newDrawing("Line", {
-            Color = ESP.TracerColor,
-            Thickness = 1.5,
-            Transparency = 1,
-        }),
-        ThreeDLines = {},
-        ThreeDOutlines = {},
-        CornerLines = {},
-        CornerOutlines = {},
-    }
-
-    for index = 1, 12 do
-        set.ThreeDOutlines[index] = newDrawing("Line", {
-            Color = Color3.new(),
-            Thickness = 1.5,
-            Transparency = 0.5,
-        })
-        set.ThreeDLines[index] = newDrawing("Line", {
-            Color = ESP.BoxColor,
-            Thickness = 1.2,
-            Transparency = 1,
-        })
+local function setVisible(object, visible)
+    if object and object.Visible ~= visible then
+        object.Visible = visible
     end
-    for index = 1, 8 do
-        set.CornerOutlines[index] = newDrawing("Line", {
-            Color = Color3.new(),
-            Thickness = 3,
-            Transparency = 0.5,
-        })
-        set.CornerLines[index] = newDrawing("Line", {
-            Color = ESP.BoxColor,
-            Thickness = 1.5,
-            Transparency = 1,
-        })
-    end
-    return set
 end
 
-local function hideESPDrawings(set)
-    for _, name in ipairs({
-        "Box", "BoxOutline", "BoxFill", "NameText", "HostileText",
-        "ForcefieldText", "ItemText", "TeamText", "DistanceText",
-        "HealthBarOutline", "HealthBarBack", "HealthBarFill", "HealthText",
-        "BodyTracer", "TracerMouse", "TracerTop", "TracerBottom",
-    }) do
-        set[name].Visible = false
+local function createSquare(filled, color, opacity, thickness)
+    local object = Instance.new("Frame")
+    object.BorderSizePixel = 0
+    object.BackgroundColor3 = color
+    object.BackgroundTransparency = filled and (1 - opacity) or 1
+    object.Visible = false
+    object.ZIndex = 1
+    object.Parent = espRoot
+
+    local outline
+    if not filled then
+        outline = Instance.new("UIStroke")
+        outline.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        outline.Color = color
+        outline.Thickness = thickness or 1
+        outline.Transparency = 1 - opacity
+        outline.Parent = object
     end
-    for _, groupName in ipairs({
-        "ThreeDLines", "ThreeDOutlines", "CornerLines",
-        "CornerOutlines",
-    }) do
-        for _, drawing in ipairs(set[groupName]) do
-            drawing.Visible = false
+
+    return object, outline
+end
+
+local function createLine(color, thickness, opacity)
+    local object = Instance.new("Frame")
+    object.AnchorPoint = Vector2.new(0.5, 0.5)
+    object.BorderSizePixel = 0
+    object.BackgroundColor3 = color
+    object.BackgroundTransparency = 1 - opacity
+    object.Size = UDim2.fromOffset(0, thickness or 1)
+    object.Visible = false
+    object.ZIndex = 1
+    object.Parent = espRoot
+    return object
+end
+
+local function createText(color)
+    local object = Instance.new("TextLabel")
+    object.AutomaticSize = Enum.AutomaticSize.XY
+    object.Size = UDim2.fromOffset(0, 0)
+    object.AnchorPoint = Vector2.new(0.5, 0.5)
+    object.BackgroundTransparency = 1
+    object.BorderSizePixel = 0
+    object.Font = espFont
+    pcall(function()
+        object.FontFace = Font.new(
+            Font.fromEnum(espFont).Family,
+            Enum.FontWeight.SemiBold,
+            Enum.FontStyle.Normal
+        )
+    end)
+    object.TextWrapped = false
+    object.RichText = false
+    object.TextColor3 = color
+    object.TextStrokeColor3 = black
+    object.TextStrokeTransparency = 0.15
+    object.TextTransparency = 0
+    object.Visible = false
+    object.ZIndex = 1
+    object.Parent = espRoot
+    return object
+end
+
+local function setSquare(object, x, y, width, height, color)
+    width = math.max(0, width)
+    height = math.max(0, height)
+    local state = getDrawState(object)
+    if state.X ~= x or state.Y ~= y then
+        state.X = x
+        state.Y = y
+        object.Position = UDim2.fromOffset(x, y)
+    end
+    if state.Width ~= width or state.Height ~= height then
+        state.Width = width
+        state.Height = height
+        object.Size = UDim2.fromOffset(width, height)
+    end
+    if color and object.BackgroundColor3 ~= color then
+        object.BackgroundColor3 = color
+        local outline = object:FindFirstChildOfClass("UIStroke")
+        if outline then
+            outline.Color = color
+        end
+    end
+    setVisible(object, true)
+end
+
+local function setLine(object, x1, y1, x2, y2, thickness, color)
+    local state = getDrawState(object)
+    if state.X1 ~= x1
+        or state.Y1 ~= y1
+        or state.X2 ~= x2
+        or state.Y2 ~= y2
+        or state.Thickness ~= thickness then
+        state.X1 = x1
+        state.Y1 = y1
+        state.X2 = x2
+        state.Y2 = y2
+        state.Thickness = thickness
+        local dx = x2 - x1
+        local dy = y2 - y1
+        object.Position = UDim2.fromOffset((x1 + x2) * 0.5, (y1 + y2) * 0.5)
+        object.Size = UDim2.fromOffset(math.sqrt(dx * dx + dy * dy), thickness)
+        object.Rotation = math.deg(math.atan2(dy, dx))
+    end
+    if color and object.BackgroundColor3 ~= color then
+        object.BackgroundColor3 = color
+    end
+    setVisible(object, true)
+end
+
+local function setText(meta, textValue, size, color)
+    local object = meta.Object
+    local changed = false
+
+    if meta.Text ~= textValue then
+        meta.Text = textValue
+        object.Text = textValue
+        changed = true
+    end
+    if meta.Size ~= size then
+        meta.Size = size
+        object.TextSize = size
+        changed = true
+    end
+    if color and meta.Color ~= color then
+        meta.Color = color
+        object.TextColor3 = color
+    end
+    if changed or not meta.Bounds then
+        meta.Bounds = object.TextBounds
+    end
+    setVisible(object, true)
+    return meta.Bounds or Vector2.zero
+end
+
+local function ensureSquare(set, key, filled, color, opacity, thickness)
+    local object = set[key]
+    if not object then
+        object = createSquare(filled, color, opacity, thickness)
+        set[key] = object
+    end
+    return object
+end
+
+local function ensureLineArray(set, key, count, color, thickness, opacity)
+    local list = set[key]
+    if not list then
+        list = table.create(count)
+        set[key] = list
+    end
+    for index = #list + 1, count do
+        list[index] = createLine(color, thickness, opacity)
+    end
+    return list
+end
+
+local function setTextPosition(meta, x, y)
+    if meta.PosX ~= x or meta.PosY ~= y then
+        meta.PosX = x
+        meta.PosY = y
+        meta.Object.Position = UDim2.fromOffset(x, y)
+    end
+end
+
+local function ensureText(set, key, color)
+    local meta = set[key]
+    if not meta then
+        meta = {
+            Object = createText(color),
+            Text = nil,
+            Size = nil,
+            Color = color,
+            Bounds = nil,
+        }
+        set[key] = meta
+    end
+    return meta
+end
+
+local squareKeys = {
+    "Box", "BoxOutline", "BoxFill", "HealthBarOutline", "HealthBarFill",
+}
+local textKeys = {
+    "NameText", "HostileText", "ForcefieldText", "ItemText",
+    "TeamText", "DistanceText", "HealthText",
+}
+local lineKeys = {
+    "BodyTracer", "TracerMouse", "TracerTop", "TracerBottom",
+}
+local lineArrayKeys = {
+    "ThreeDLines", "ThreeDOutlines", "CornerLines", "CornerOutlines",
+}
+
+local function hideSet(set)
+    if set.Hidden then
+        return
+    end
+    set.Hidden = true
+    for _, key in ipairs(squareKeys) do
+        setVisible(set[key], false)
+    end
+    for _, key in ipairs(textKeys) do
+        local meta = set[key]
+        if meta then
+            setVisible(meta.Object, false)
+        end
+    end
+    for _, key in ipairs(lineKeys) do
+        setVisible(set[key], false)
+    end
+    for _, key in ipairs(lineArrayKeys) do
+        local list = set[key]
+        if list then
+            for _, object in ipairs(list) do
+                setVisible(object, false)
+            end
+        end
+    end
+end
+
+local function destroySet(set)
+    for _, key in ipairs(squareKeys) do
+        local object = set[key]
+        if object then
+            object:Destroy()
+            set[key] = nil
+        end
+    end
+    for _, key in ipairs(textKeys) do
+        local meta = set[key]
+        if meta and meta.Object then
+            meta.Object:Destroy()
+        end
+        set[key] = nil
+    end
+    for _, key in ipairs(lineKeys) do
+        local object = set[key]
+        if object then
+            object:Destroy()
+            set[key] = nil
+        end
+    end
+    for _, key in ipairs(lineArrayKeys) do
+        local list = set[key]
+        if list then
+            for _, object in ipairs(list) do
+                object:Destroy()
+            end
+        end
+        set[key] = nil
+    end
+    set.Character = nil
+    set.Humanoid = nil
+    set.Root = nil
+    table.clear(set.Parts)
+    table.clear(set.Stacked)
+end
+
+local function clearAllSets()
+    for _, set in pairs(ESP.Drawings) do
+        destroySet(set)
+    end
+    table.clear(ESP.Drawings)
+end
+
+local function destroySetObject(set, key)
+    local object = set[key]
+    if object then
+        object:Destroy()
+        set[key] = nil
+    end
+end
+
+local function destroySetText(set, key)
+    local meta = set[key]
+    if meta then
+        if meta.Object then
+            meta.Object:Destroy()
+        end
+        set[key] = nil
+    end
+end
+
+local function destroySetArray(set, key)
+    local list = set[key]
+    if list then
+        for _, object in ipairs(list) do
+            object:Destroy()
+        end
+        set[key] = nil
+    end
+end
+
+local function trimInactiveESPObjects()
+    for _, set in pairs(ESP.Drawings) do
+        if not ESP.BoxEnabled then
+            destroySetObject(set, "Box")
+            destroySetObject(set, "BoxOutline")
+        end
+        if not (ESP.BoxFillEnabled and ESP.BoxMasterEnabled and ESP.BoxType ~= "Corner") then
+            destroySetObject(set, "BoxFill")
+        end
+        if not ESP.CornerBoxEnabled then
+            destroySetArray(set, "CornerLines")
+            destroySetArray(set, "CornerOutlines")
+        end
+        if not ESP.ThreeDBoxEnabled then
+            destroySetArray(set, "ThreeDLines")
+            destroySetArray(set, "ThreeDOutlines")
+        end
+        if not (ESP.NameEnabled or ESP.DisplayNameEnabled) then
+            destroySetText(set, "NameText")
+        end
+        if not ESP.HostileEnabled then destroySetText(set, "HostileText") end
+        if not ESP.ForcefieldEnabled then destroySetText(set, "ForcefieldText") end
+        if not ESP.ItemEnabled then destroySetText(set, "ItemText") end
+        if not ESP.TeamIndicatorEnabled then destroySetText(set, "TeamText") end
+        if not ESP.DistanceEnabled then destroySetText(set, "DistanceText") end
+        if not ESP.HealthTextEnabled then destroySetText(set, "HealthText") end
+        if not ESP.HealthBarEnabled then
+            destroySetObject(set, "HealthBarOutline")
+            destroySetObject(set, "HealthBarFill")
+        end
+
+        if not ESP.TracersEnabled or ESP.TracerType ~= "Body" then
+            destroySetObject(set, "BodyTracer")
+        end
+        if not ESP.TracersEnabled or ESP.TracerType ~= "Mouse" then
+            destroySetObject(set, "TracerMouse")
+        end
+        if not ESP.TracersEnabled or ESP.TracerType ~= "Top" then
+            destroySetObject(set, "TracerTop")
+        end
+        if not ESP.TracersEnabled or ESP.TracerType ~= "Bottom" then
+            destroySetObject(set, "TracerBottom")
         end
     end
 end
 
 function ESP:Unload()
-    for _, set in pairs(self.Drawings) do
-        hideESPDrawings(set)
-        for _, drawing in pairs(set) do
-            if typeof(drawing) == "table" and drawing._GuiDrawing then
-                drawing:Remove()
-            elseif typeof(drawing) == "table" then
-                for _, nested in ipairs(drawing) do
-                    nested:Remove()
-                end
-            else
-                drawing:Remove()
-            end
-        end
-    end
-    table.clear(self.Drawings)
-    if espGui then
+    clearAllSets()
+    if espGui and espGui.Parent then
         espGui:Destroy()
     end
 end
 
-local function characterBounds(character)
-    local minimum
-    local maximum
+local function ensureSet(player)
+    local set = ESP.Drawings[player]
+    if not set then
+        set = {
+            Player = player,
+            Hidden = true,
+            Character = nil,
+            Humanoid = nil,
+            Root = nil,
+            Parts = {},
+            NextPartRefresh = 0,
+            BoundsRefreshAt = 0,
+            BoundsMinOffset = nil,
+            BoundsMaxOffset = nil,
+            GeometryRefreshAt = 0,
+            GeometryRootX = 0,
+            GeometryRootY = 0,
+            GeometryMinX = nil,
+            GeometryMinY = nil,
+            GeometryMaxX = nil,
+            GeometryMaxY = nil,
+            GeometryWas3D = false,
+            WorldCorners = table.create(8),
+            ScreenCorners = table.create(8),
+            InFront = table.create(8),
+            Stacked = table.create(6),
+            ItemTextValue = nil,
+            ItemCheckAt = 0,
+            ForcefieldCheckAt = 0,
+            HasForcefield = false,
+        }
+        ESP.Drawings[player] = set
+    end
+    return set
+end
 
-    for _, part in ipairs(character:GetChildren()) do
-        if part:IsA("BasePart") then
-            local half = part.Size * 0.5
+local function refreshCharacter(set, character, now, refreshParts)
+    if set.Character ~= character then
+        hideSet(set)
+        set.Character = character
+        set.Humanoid = nil
+        set.Root = nil
+        set.NextPartRefresh = 0
+        set.BoundsRefreshAt = 0
+        set.BoundsMinOffset = nil
+        set.BoundsMaxOffset = nil
+        set.GeometryRefreshAt = 0
+        set.GeometryMinX = nil
+        set.GeometryMinY = nil
+        set.GeometryMaxX = nil
+        set.GeometryMaxY = nil
+        set.GeometryWas3D = false
+        set.ItemTextValue = nil
+        set.ItemCheckAt = 0
+        set.ForcefieldCheckAt = 0
+        set.HasForcefield = false
+        table.clear(set.Parts)
+    end
+
+    if not character then
+        return nil, nil
+    end
+
+    local humanoid = set.Humanoid
+    if not humanoid or humanoid.Parent ~= character then
+        humanoid = character:FindFirstChildOfClass("Humanoid")
+        set.Humanoid = humanoid
+    end
+
+    local root = set.Root
+    if not root or root.Parent ~= character then
+        root = character:FindFirstChild("HumanoidRootPart")
+        set.Root = root
+    end
+
+    if refreshParts and now >= set.NextPartRefresh then
+        set.NextPartRefresh = now + 1
+        table.clear(set.Parts)
+        for _, child in ipairs(character:GetChildren()) do
+            if child:IsA("BasePart") then
+                set.Parts[#set.Parts + 1] = child
+            end
+        end
+    end
+
+    return humanoid, root
+end
+
+local function characterBounds(set, root, now)
+    if set.BoundsMinOffset
+        and set.BoundsMaxOffset
+        and now < set.BoundsRefreshAt then
+        local position = root.Position
+        local minimum = position + set.BoundsMinOffset
+        local maximum = position + set.BoundsMaxOffset
+        return minimum.X, minimum.Y, minimum.Z, maximum.X, maximum.Y, maximum.Z
+    end
+
+    local minX
+    local minY
+    local minZ
+    local maxX
+    local maxY
+    local maxZ
+
+    for _, part in ipairs(set.Parts) do
+        if part.Parent == set.Character then
+            local size = part.Size
+            local halfX = size.X * 0.5
+            local halfY = size.Y * 0.5
+            local halfZ = size.Z * 0.5
             local cframe = part.CFrame
             local right = cframe.RightVector
             local up = cframe.UpVector
             local look = cframe.LookVector
 
-            local extentX = math.abs(right.X) * half.X
-                + math.abs(up.X) * half.Y
-                + math.abs(look.X) * half.Z
-            local extentY = math.abs(right.Y) * half.X
-                + math.abs(up.Y) * half.Y
-                + math.abs(look.Y) * half.Z
-            local extentZ = math.abs(right.Z) * half.X
-                + math.abs(up.Z) * half.Y
-                + math.abs(look.Z) * half.Z
+            local extentX = math.abs(right.X) * halfX
+                + math.abs(up.X) * halfY
+                + math.abs(look.X) * halfZ
+            local extentY = math.abs(right.Y) * halfX
+                + math.abs(up.Y) * halfY
+                + math.abs(look.Y) * halfZ
+            local extentZ = math.abs(right.Z) * halfX
+                + math.abs(up.Z) * halfY
+                + math.abs(look.Z) * halfZ
 
             local position = part.Position
-            local partMinimum = Vector3.new(
-                position.X - extentX,
-                position.Y - extentY,
-                position.Z - extentZ
-            )
-            local partMaximum = Vector3.new(
-                position.X + extentX,
-                position.Y + extentY,
-                position.Z + extentZ
-            )
+            local partMinX = position.X - extentX
+            local partMinY = position.Y - extentY
+            local partMinZ = position.Z - extentZ
+            local partMaxX = position.X + extentX
+            local partMaxY = position.Y + extentY
+            local partMaxZ = position.Z + extentZ
 
-            if minimum then
-                minimum = Vector3.new(
-                    math.min(minimum.X, partMinimum.X),
-                    math.min(minimum.Y, partMinimum.Y),
-                    math.min(minimum.Z, partMinimum.Z)
-                )
-                maximum = Vector3.new(
-                    math.max(maximum.X, partMaximum.X),
-                    math.max(maximum.Y, partMaximum.Y),
-                    math.max(maximum.Z, partMaximum.Z)
-                )
+            if minX then
+                minX = math.min(minX, partMinX)
+                minY = math.min(minY, partMinY)
+                minZ = math.min(minZ, partMinZ)
+                maxX = math.max(maxX, partMaxX)
+                maxY = math.max(maxY, partMaxY)
+                maxZ = math.max(maxZ, partMaxZ)
             else
-                minimum = partMinimum
-                maximum = partMaximum
+                minX, minY, minZ = partMinX, partMinY, partMinZ
+                maxX, maxY, maxZ = partMaxX, partMaxY, partMaxZ
             end
         end
     end
 
-    return minimum, maximum
+    if minX then
+        local rootPosition = root.Position
+        set.BoundsMinOffset = Vector3.new(
+            minX - rootPosition.X,
+            minY - rootPosition.Y,
+            minZ - rootPosition.Z
+        )
+        set.BoundsMaxOffset = Vector3.new(
+            maxX - rootPosition.X,
+            maxY - rootPosition.Y,
+            maxZ - rootPosition.Z
+        )
+        set.BoundsRefreshAt = now + 0.05
+    end
+
+    return minX, minY, minZ, maxX, maxY, maxZ
 end
 
 local function worldToScreen(position)
     local point, onScreen = camera:WorldToViewportPoint(position)
-    return Vector2.new(point.X, point.Y), onScreen
+    return point.X, point.Y, onScreen and point.Z > 0
 end
 
-local function screenBounds(worldCorners, need3D)
+local function screenBounds(set, min3X, min3Y, min3Z, max3X, max3Y, max3Z, need3D)
+    local worldCorners = set.WorldCorners
+    worldCorners[1] = Vector3.new(min3X, min3Y, min3Z)
+    worldCorners[2] = Vector3.new(min3X, min3Y, max3Z)
+    worldCorners[3] = Vector3.new(min3X, max3Y, min3Z)
+    worldCorners[4] = Vector3.new(min3X, max3Y, max3Z)
+    worldCorners[5] = Vector3.new(max3X, min3Y, min3Z)
+    worldCorners[6] = Vector3.new(max3X, min3Y, max3Z)
+    worldCorners[7] = Vector3.new(max3X, max3Y, min3Z)
+    worldCorners[8] = Vector3.new(max3X, max3Y, max3Z)
+
     local cameraCFrame = camera.CFrame
     local cameraPosition = cameraCFrame.Position
     local cameraLook = cameraCFrame.LookVector
     local nearPlane = 0.5
-    local minimum
-    local maximum
-    local cornerPoints = need3D and table.create(8) or nil
-    local cornerInFront = need3D and table.create(8) or nil
+    local minX
+    local minY
+    local maxX
+    local maxY
+    local screenCorners = set.ScreenCorners
+    local inFront = set.InFront
     local frontCount = 0
-
-    local function includePoint(point)
-        if minimum then
-            minimum = Vector2.new(
-                math.min(minimum.X, point.X),
-                math.min(minimum.Y, point.Y)
-            )
-            maximum = Vector2.new(
-                math.max(maximum.X, point.X),
-                math.max(maximum.Y, point.Y)
-            )
-        else
-            minimum = point
-            maximum = point
-        end
-    end
 
     for index = 1, 8 do
         local corner = worldCorners[index]
-        local inFront = (corner - cameraPosition):Dot(cameraLook) >= nearPlane
-        if need3D then
-            cornerInFront[index] = inFront
-        end
-        if inFront then
+        local front = (corner - cameraPosition):Dot(cameraLook) >= nearPlane
+        inFront[index] = front
+        if front then
             frontCount += 1
-            local point = worldToScreen(corner)
+            local point = camera:WorldToViewportPoint(corner)
+            local x = point.X
+            local y = point.Y
             if need3D then
-                cornerPoints[index] = point
+                local saved = screenCorners[index]
+                if saved then
+                    saved = Vector2.new(x, y)
+                    screenCorners[index] = saved
+                else
+                    screenCorners[index] = Vector2.new(x, y)
+                end
             end
-            includePoint(point)
+            minX = minX and math.min(minX, x) or x
+            minY = minY and math.min(minY, y) or y
+            maxX = maxX and math.max(maxX, x) or x
+            maxY = maxY and math.max(maxY, y) or y
+        elseif need3D then
+            screenCorners[index] = nil
         end
     end
 
@@ -6112,133 +6292,146 @@ local function screenBounds(worldCorners, need3D)
                 local denominator = firstDepth - secondDepth
                 if math.abs(denominator) > 0.000001 then
                     local alpha = firstDepth / denominator
-                    includePoint(worldToScreen(first + (second - first) * alpha))
+                    local point = camera:WorldToViewportPoint(first + (second - first) * alpha)
+                    local x = point.X
+                    local y = point.Y
+                    minX = minX and math.min(minX, x) or x
+                    minY = minY and math.min(minY, y) or y
+                    maxX = maxX and math.max(maxX, x) or x
+                    maxY = maxY and math.max(maxY, y) or y
                 end
             end
         end
     end
 
-    return minimum, maximum, cornerPoints, cornerInFront
+    return minX, minY, maxX, maxY, screenCorners, inFront
 end
 
-local function update3DBox(set, corners, inFront, color)
+local function update3DBox(set, screenCorners, inFront, offsetX, offsetY)
+    local outlines = ensureLineArray(set, "ThreeDOutlines", 12, black, 1.5, 0.5)
+    local lines = ensureLineArray(set, "ThreeDLines", 12, ESP.BoxColor, 1.2, 1)
+    offsetX = offsetX or 0
+    offsetY = offsetY or 0
+
     for index, edge in ipairs(edges3D) do
-        local visible = inFront[edge[1]]
-            and inFront[edge[2]]
-            and corners[edge[1]]
-            and corners[edge[2]]
-        local line = set.ThreeDLines[index]
-        local outline = set.ThreeDOutlines[index]
+        local first = screenCorners[edge[1]]
+        local second = screenCorners[edge[2]]
+        local visible = inFront[edge[1]] and inFront[edge[2]] and first and second
         if visible then
-            line.From = corners[edge[1]]
-            line.To = corners[edge[2]]
-            line.Color = color
-            line.Visible = true
-            outline.From = line.From
-            outline.To = line.To
-            outline.Visible = true
+            local firstX = first.X + offsetX
+            local firstY = first.Y + offsetY
+            local secondX = second.X + offsetX
+            local secondY = second.Y + offsetY
+            setLine(outlines[index], firstX, firstY, secondX, secondY, 1.5, black)
+            setLine(lines[index], firstX, firstY, secondX, secondY, 1.2, ESP.BoxColor)
         else
-            line.Visible = false
-            outline.Visible = false
+            setVisible(lines[index], false)
+            setVisible(outlines[index], false)
         end
     end
 end
 
-local function updateCornerBox(set, minimum, maximum, color)
-    local width = maximum.X - minimum.X
-    local height = maximum.Y - minimum.Y
-    local length = math.max(2, math.min(width, height) * 0.25)
-    local topLeft = minimum
-    local topRight = Vector2.new(maximum.X, minimum.Y)
-    local bottomLeft = Vector2.new(minimum.X, maximum.Y)
-    local bottomRight = maximum
+local function updateCornerBox(set, minX, minY, maxX, maxY)
+    local outlines = ensureLineArray(set, "CornerOutlines", 8, black, 3, 0.5)
+    local lines = ensureLineArray(set, "CornerLines", 8, ESP.BoxColor, 1.5, 1)
 
-    local function setLine(index, from, to)
-        local line = set.CornerLines[index]
-        local outline = set.CornerOutlines[index]
-        line.From = from
-        line.To = to
-        line.Color = color
-        line.Visible = true
-        outline.From = from
-        outline.To = to
-        outline.Visible = true
+    local width = maxX - minX
+    local height = maxY - minY
+    local length = math.max(2, math.min(width, height) * 0.25)
+
+    local function draw(index, x1, y1, x2, y2)
+        setLine(outlines[index], x1, y1, x2, y2, 3, black)
+        setLine(lines[index], x1, y1, x2, y2, 1.5, ESP.BoxColor)
     end
 
-    setLine(1, topLeft, topLeft + Vector2.new(length, 0))
-    setLine(2, topLeft, topLeft + Vector2.new(0, length))
-    setLine(3, topRight, topRight - Vector2.new(length, 0))
-    setLine(4, topRight, topRight + Vector2.new(0, length))
-    setLine(5, bottomLeft, bottomLeft + Vector2.new(length, 0))
-    setLine(6, bottomLeft, bottomLeft - Vector2.new(0, length))
-    setLine(7, bottomRight, bottomRight - Vector2.new(length, 0))
-    setLine(8, bottomRight, bottomRight - Vector2.new(0, length))
+    draw(1, minX, minY, minX + length, minY)
+    draw(2, minX, minY, minX, minY + length)
+    draw(3, maxX, minY, maxX - length, minY)
+    draw(4, maxX, minY, maxX, minY + length)
+    draw(5, minX, maxY, minX + length, maxY)
+    draw(6, minX, maxY, minX, maxY - length)
+    draw(7, maxX, maxY, maxX - length, maxY)
+    draw(8, maxX, maxY, maxX, maxY - length)
+end
+
+local function getCharacterItems(set, now)
+    if now < set.ItemCheckAt then
+        return set.ItemTextValue
+    end
+    set.ItemCheckAt = now + 0.25
+
+    local count = 0
+    local names = set.ItemNames
+    if not names then
+        names = table.create(2)
+        set.ItemNames = names
+    end
+    table.clear(names)
+
+    for _, child in ipairs(set.Character:GetChildren()) do
+        if child:IsA("Tool") then
+            count += 1
+            names[count] = child.Name
+        end
+    end
+
+    set.ItemTextValue = count > 0 and table.concat(names, ", ") or nil
+    return set.ItemTextValue
+end
+
+local function hasForcefield(set, now)
+    if now >= set.ForcefieldCheckAt then
+        set.ForcefieldCheckAt = now + 0.20
+        set.HasForcefield = set.Character:FindFirstChildOfClass("ForceField") ~= nil
+    end
+    return set.HasForcefield
 end
 
 local espPlayers = {}
 for _, player in ipairs(Players:GetPlayers()) do
     if player ~= LocalPlayer then
-        table.insert(espPlayers, player)
+        espPlayers[#espPlayers + 1] = player
     end
 end
 
 connect(Players.PlayerAdded, function(player)
     if player ~= LocalPlayer then
-        table.insert(espPlayers, player)
+        espPlayers[#espPlayers + 1] = player
     end
 end)
-
-local espItemCache = setmetatable({}, {__mode = "k"})
-
-local function getCharacterItems(character, now)
-    local cached = espItemCache[character]
-    if cached and now - cached.Time < 0.20 then
-        return cached.Text
-    end
-
-    local itemCount = 0
-    local itemNames = table.create(2)
-    for _, child in ipairs(character:GetChildren()) do
-        if child:IsA("Tool") then
-            itemCount += 1
-            itemNames[itemCount] = child.Name
-        end
-    end
-
-    local textValue = itemCount > 0 and table.concat(itemNames, ", ") or nil
-    espItemCache[character] = {
-        Time = now,
-        Text = textValue,
-    }
-    return textValue
-end
 
 local namePulseFrom = Color3.fromRGB(255, 255, 255)
 local namePulseTo = Color3.fromRGB(170, 0, 255)
 local espHadActiveFeature = false
+local espAccumulator = 0
+local espUpdateInterval = 1 / 60
+local lastEspFeatureSignature = -1
 
 local function hidePlayerESP(player)
     local set = ESP.Drawings[player]
     if set then
-        hideESPDrawings(set)
+        hideSet(set)
     end
 end
 
-connect(RunService.RenderStepped, function()
+connect(RunService.RenderStepped, function(deltaTime)
     if not runtimeAlive then
         return
     end
 
-    local anyFeature = ESP.BoxEnabled
-        or ESP.CornerBoxEnabled
-        or ESP.BoxFillEnabled
+    local boxActive = ESP.BoxMasterEnabled
+    local boxFillActive = ESP.BoxFillEnabled
+        and boxActive
+        and ESP.BoxType ~= "Corner"
+
+    local anyFeature = boxActive
+        or boxFillActive
         or ESP.NameEnabled
         or ESP.DisplayNameEnabled
         or ESP.ItemEnabled
         or ESP.HostileEnabled
         or ESP.ForcefieldEnabled
         or ESP.TeamIndicatorEnabled
-        or ESP.ThreeDBoxEnabled
         or ESP.TracersEnabled
         or ESP.DistanceEnabled
         or ESP.HealthBarEnabled
@@ -6247,42 +6440,104 @@ connect(RunService.RenderStepped, function()
     if not anyFeature then
         if espHadActiveFeature then
             espHadActiveFeature = false
-            for _, set in pairs(ESP.Drawings) do
-                hideESPDrawings(set)
-            end
+            clearAllSets()
         end
         return
     end
     espHadActiveFeature = true
+
+    -- When a feature is switched off, destroy its no-longer-used GUI primitives
+    -- once instead of retaining every ESP type a player has ever toggled.
+    local tracerMode = ESP.TracerType == "Body" and 1
+        or ESP.TracerType == "Mouse" and 2
+        or ESP.TracerType == "Top" and 3
+        or 4
+    local featureSignature = tracerMode * 65536
+        + (ESP.BoxEnabled and 1 or 0)
+        + (ESP.CornerBoxEnabled and 2 or 0)
+        + (ESP.ThreeDBoxEnabled and 4 or 0)
+        + (boxFillActive and 8 or 0)
+        + (ESP.NameEnabled and 16 or 0)
+        + (ESP.DisplayNameEnabled and 32 or 0)
+        + (ESP.ItemEnabled and 64 or 0)
+        + (ESP.HostileEnabled and 128 or 0)
+        + (ESP.ForcefieldEnabled and 256 or 0)
+        + (ESP.TeamIndicatorEnabled and 512 or 0)
+        + (ESP.TracersEnabled and 1024 or 0)
+        + (ESP.DistanceEnabled and 2048 or 0)
+        + (ESP.HealthBarEnabled and 4096 or 0)
+        + (ESP.HealthTextEnabled and 8192 or 0)
+    if featureSignature ~= lastEspFeatureSignature then
+        lastEspFeatureSignature = featureSignature
+        trimInactiveESPObjects()
+    end
+
+    -- 60 Hz keeps the overlay visually fluid while preventing high-FPS clients
+    -- from doing identical ESP projection/UI work 140-240 times per second.
+    espAccumulator = math.min(espAccumulator + math.max(deltaTime, 0), espUpdateInterval * 3)
+    if espAccumulator < espUpdateInterval then
+        return
+    end
+    espAccumulator -= espUpdateInterval
 
     camera = workspace.CurrentCamera
     if not camera then
         return
     end
 
-    local clock = os.clock()
-    local mousePosition = ESP.TracersEnabled and ESP.TracerType == "Mouse"
-        and (UserInputService:GetMouseLocation() - GuiService:GetGuiInset())
-        or Vector2.zero
+    local now = os.clock()
     local cameraPosition = camera.CFrame.Position
     local viewport = camera.ViewportSize
+    local mouseX = 0
+    local mouseY = 0
+    if ESP.TracersEnabled and ESP.TracerType == "Mouse" then
+        local mousePosition = UserInputService:GetMouseLocation()
+        mouseX = mousePosition.X
+        mouseY = mousePosition.Y
+    end
+
     local namePulseColor
     if ESP.NameEnabled or ESP.DisplayNameEnabled then
         namePulseColor = lerpColor(
             namePulseFrom,
             namePulseTo,
-            (math.sin(clock * 1.5) + 1) * 0.5
+            (math.sin(now * 1.5) + 1) * 0.5
         )
     end
 
-    local bodyTracerFrom
+    local bodyFromX
+    local bodyFromY
     if ESP.TracersEnabled and ESP.TracerType == "Body" then
         local localCharacter = LocalPlayer.Character
         local localRoot = localCharacter and localCharacter:FindFirstChild("HumanoidRootPart")
         if localRoot then
-            bodyTracerFrom = worldToScreen(localRoot.Position)
+            bodyFromX, bodyFromY = worldToScreen(localRoot.Position)
         end
     end
+
+    local needsBounds = boxActive
+        or boxFillActive
+        or ESP.NameEnabled
+        or ESP.DisplayNameEnabled
+        or ESP.ItemEnabled
+        or ESP.HostileEnabled
+        or ESP.ForcefieldEnabled
+        or ESP.TeamIndicatorEnabled
+        or ESP.DistanceEnabled
+        or ESP.HealthBarEnabled
+        or ESP.HealthTextEnabled
+
+    local needsScale = ESP.NameEnabled
+        or ESP.DisplayNameEnabled
+        or ESP.ItemEnabled
+        or ESP.HostileEnabled
+        or ESP.ForcefieldEnabled
+        or ESP.TeamIndicatorEnabled
+        or ESP.DistanceEnabled
+        or ESP.HealthBarEnabled
+        or ESP.HealthTextEnabled
+
+    local cullMargin = math.max(300, math.min(viewport.X, viewport.Y) * 0.25)
 
     for _, player in ipairs(espPlayers) do
         if ESP.TeamCheckEnabled
@@ -6293,274 +6548,371 @@ connect(RunService.RenderStepped, function()
         end
 
         local character = player.Character
-        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-        local root = character and character:FindFirstChild("HumanoidRootPart")
+        local set = ensureSet(player)
+        local humanoid, root = refreshCharacter(set, character, now, needsBounds)
         if not character or not humanoid or humanoid.Health <= 0 or not root then
-            hidePlayerESP(player)
+            hideSet(set)
             continue
         end
 
-        local set = ESP.Drawings[player]
-        if not set then
-            set = createESPDrawings()
-            ESP.Drawings[player] = set
-        end
-
-        local minimum3D, maximum3D = characterBounds(character)
-        if not minimum3D or not maximum3D then
-            hideESPDrawings(set)
+        -- One cheap root projection is shared by culling, geometry translation,
+        -- and tracers. Expensive eight-corner body projection is refreshed at
+        -- 30 Hz and translated smoothly between refreshes.
+        local rootPoint = camera:WorldToViewportPoint(root.Position)
+        if rootPoint.Z <= 0
+            or rootPoint.X < -cullMargin
+            or rootPoint.X > viewport.X + cullMargin
+            or rootPoint.Y < -cullMargin
+            or rootPoint.Y > viewport.Y + cullMargin then
+            hideSet(set)
             continue
         end
 
-        local worldCorners = {
-            Vector3.new(minimum3D.X, minimum3D.Y, minimum3D.Z),
-            Vector3.new(minimum3D.X, minimum3D.Y, maximum3D.Z),
-            Vector3.new(minimum3D.X, maximum3D.Y, minimum3D.Z),
-            Vector3.new(minimum3D.X, maximum3D.Y, maximum3D.Z),
-            Vector3.new(maximum3D.X, minimum3D.Y, minimum3D.Z),
-            Vector3.new(maximum3D.X, minimum3D.Y, maximum3D.Z),
-            Vector3.new(maximum3D.X, maximum3D.Y, minimum3D.Z),
-            Vector3.new(maximum3D.X, maximum3D.Y, maximum3D.Z),
-        }
-        local minimum, maximum, corners, inFront = screenBounds(worldCorners, ESP.ThreeDBoxEnabled)
-        if not minimum or not maximum then
-            hideESPDrawings(set)
-            continue
-        end
+        set.Hidden = false
 
-        local width = maximum.X - minimum.X
-        local height = maximum.Y - minimum.Y
-        if width > viewport.X * 10 or height > viewport.Y * 10 then
-            hideESPDrawings(set)
-            continue
-        end
-
-        local distance = math.floor((cameraPosition - root.Position).Magnitude)
+        local distance
         local scale = 1
-        if distance > 400 then
-            scale = math.max(0.4, 1 - ((distance - 400) / 600) * 0.6)
-        end
-
-        local textColor = ESP.TextColor
-        local boxColor = ESP.BoxColor
-        local tracerColor = ESP.TracerColor
-        if ESP.TeamColorEnabled and player.Team then
-            textColor = player.Team.TeamColor.Color
-            tracerColor = textColor
-        end
-
-        if ESP.BoxEnabled then
-            set.Box.Size = Vector2.new(width, height)
-            set.Box.Position = minimum
-            set.Box.Color = boxColor
-            set.Box.Visible = true
-            set.BoxOutline.Size = Vector2.new(width + 2, height + 2)
-            set.BoxOutline.Position = minimum - Vector2.new(1, 1)
-            set.BoxOutline.Visible = true
-        else
-            set.Box.Visible = false
-            set.BoxOutline.Visible = false
-        end
-
-        if ESP.BoxFillEnabled and (ESP.BoxEnabled or ESP.ThreeDBoxEnabled) then
-            set.BoxFill.Size = Vector2.new(width, height)
-            set.BoxFill.Position = minimum
-            set.BoxFill.Visible = true
-        else
-            set.BoxFill.Visible = false
-        end
-
-        if ESP.CornerBoxEnabled then
-            updateCornerBox(set, minimum, maximum, boxColor)
-        else
-            for index = 1, 8 do
-                set.CornerLines[index].Visible = false
-                set.CornerOutlines[index].Visible = false
+        if needsScale then
+            distance = math.floor((cameraPosition - root.Position).Magnitude)
+            if distance > 400 then
+                scale = math.max(0.4, 1 - ((distance - 400) / 600) * 0.6)
             end
         end
 
-        if ESP.ThreeDBoxEnabled then
-            update3DBox(set, corners, inFront, boxColor)
-        else
-            for index = 1, 12 do
-                set.ThreeDLines[index].Visible = false
-                set.ThreeDOutlines[index].Visible = false
-            end
-        end
+        local minX
+        local minY
+        local maxX
+        local maxY
+        local screenCorners
+        local inFront
+        local geometryOffsetX = 0
+        local geometryOffsetY = 0
 
-        if ESP.NameEnabled or ESP.DisplayNameEnabled then
-            set.NameText.Size = math.max(6, math.floor(14 * scale))
-            set.NameText.Text = ESP.DisplayNameEnabled and player.DisplayName or player.Name
-            set.NameText.Color = namePulseColor
-            set.NameText.Position = Vector2.new(
-                (minimum.X + maximum.X) * 0.5,
-                minimum.Y - 5 * scale - set.NameText.TextBounds.Y / 2
-            )
-            set.NameText.Visible = true
-        else
-            set.NameText.Visible = false
-        end
+        if needsBounds then
+            local needs3DGeometry = ESP.ThreeDBoxEnabled
+            local refreshGeometry = now >= set.GeometryRefreshAt
+                or not set.GeometryMinX
+                or (needs3DGeometry and not set.GeometryWas3D)
 
-        local rightX = maximum.X + 4 * scale
-        local gap = math.max(1, 4 * scale)
-        local stacked = {}
+            if refreshGeometry then
+                local min3X, min3Y, min3Z, max3X, max3Y, max3Z =
+                    characterBounds(set, root, now)
+                if not min3X then
+                    hideSet(set)
+                    continue
+                end
 
-        if ESP.HostileEnabled
-            and (character:GetAttribute("Hostile") == true
-                or player:GetAttribute("Hostile") == true) then
-            set.HostileText.Size = math.max(6, math.floor(13 * scale))
-            set.HostileText.Text = "Hostile"
-            set.HostileText.Visible = true
-            table.insert(stacked, set.HostileText)
-        else
-            set.HostileText.Visible = false
-        end
+                minX, minY, maxX, maxY, screenCorners, inFront = screenBounds(
+                    set,
+                    min3X,
+                    min3Y,
+                    min3Z,
+                    max3X,
+                    max3Y,
+                    max3Z,
+                    needs3DGeometry
+                )
 
-        if ESP.ForcefieldEnabled and character:FindFirstChildOfClass("ForceField") then
-            set.ForcefieldText.Size = math.max(6, math.floor(13 * scale))
-            set.ForcefieldText.Text = "Forcefield"
-            set.ForcefieldText.Visible = true
-            table.insert(stacked, set.ForcefieldText)
-        else
-            set.ForcefieldText.Visible = false
-        end
+                if not minX or not minY or not maxX or not maxY then
+                    hideSet(set)
+                    continue
+                end
 
-        if ESP.ItemEnabled then
-            local itemText = getCharacterItems(character, clock)
-            if itemText then
-                set.ItemText.Size = math.max(6, math.floor(13 * scale))
-                set.ItemText.Text = itemText
-                set.ItemText.Color = textColor
-                set.ItemText.Visible = true
-                table.insert(stacked, set.ItemText)
+                set.GeometryMinX = minX
+                set.GeometryMinY = minY
+                set.GeometryMaxX = maxX
+                set.GeometryMaxY = maxY
+                set.GeometryRootX = rootPoint.X
+                set.GeometryRootY = rootPoint.Y
+                set.GeometryRefreshAt = now + (1 / 30)
+                set.GeometryWas3D = needs3DGeometry
             else
-                set.ItemText.Visible = false
+                geometryOffsetX = rootPoint.X - set.GeometryRootX
+                geometryOffsetY = rootPoint.Y - set.GeometryRootY
+                minX = set.GeometryMinX + geometryOffsetX
+                minY = set.GeometryMinY + geometryOffsetY
+                maxX = set.GeometryMaxX + geometryOffsetX
+                maxY = set.GeometryMaxY + geometryOffsetY
+                screenCorners = set.ScreenCorners
+                inFront = set.InFront
+            end
+
+            local width = maxX - minX
+            local height = maxY - minY
+            if width > viewport.X * 10 or height > viewport.Y * 10 then
+                hideSet(set)
+                continue
+            end
+
+            if ESP.BoxEnabled then
+                local outline = ensureSquare(set, "BoxOutline", false, black, 0.5, 1.5)
+                local box = ensureSquare(set, "Box", false, ESP.BoxColor, 1, 1.5)
+                setSquare(outline, minX - 1, minY - 1, width + 2, height + 2, black)
+                setSquare(box, minX, minY, width, height, ESP.BoxColor)
+            else
+                setVisible(set.Box, false)
+                setVisible(set.BoxOutline, false)
+            end
+
+            if boxFillActive then
+                local fill = ensureSquare(set, "BoxFill", true, ESP.BoxFillColor, 0.6, 1)
+                setSquare(fill, minX, minY, width, height, ESP.BoxFillColor)
+            else
+                setVisible(set.BoxFill, false)
+            end
+
+            if ESP.CornerBoxEnabled then
+                updateCornerBox(set, minX, minY, maxX, maxY)
+            elseif set.CornerLines then
+                for index = 1, #set.CornerLines do
+                    setVisible(set.CornerLines[index], false)
+                    setVisible(set.CornerOutlines[index], false)
+                end
+            end
+
+            if ESP.ThreeDBoxEnabled then
+                update3DBox(set, screenCorners, inFront, geometryOffsetX, geometryOffsetY)
+            elseif set.ThreeDLines then
+                for index = 1, #set.ThreeDLines do
+                    setVisible(set.ThreeDLines[index], false)
+                    setVisible(set.ThreeDOutlines[index], false)
+                end
+            end
+
+            if ESP.NameEnabled or ESP.DisplayNameEnabled then
+                local name = ensureText(set, "NameText", ESP.TextColor)
+                local size = math.max(6, math.floor(14 * scale))
+                local bounds = setText(
+                    name,
+                    ESP.DisplayNameEnabled and player.DisplayName or player.Name,
+                    size,
+                    namePulseColor
+                )
+                setTextPosition(
+                    name,
+                    (minX + maxX) * 0.5,
+                    minY - 5 * scale - bounds.Y * 0.5
+                )
+            elseif set.NameText then
+                setVisible(set.NameText.Object, false)
+            end
+
+            local rightX = maxX + 4 * scale
+            local gap = math.max(1, 4 * scale)
+            local textSize = math.max(6, math.floor(13 * scale))
+            local stacked = set.Stacked
+            table.clear(stacked)
+
+            if ESP.HostileEnabled
+                and (character:GetAttribute("Hostile") == true
+                    or player:GetAttribute("Hostile") == true) then
+                local meta = ensureText(set, "HostileText", healthRed)
+                setText(meta, "Hostile", textSize, healthRed)
+                stacked[#stacked + 1] = meta
+            elseif set.HostileText then
+                setVisible(set.HostileText.Object, false)
+            end
+
+            if ESP.ForcefieldEnabled and hasForcefield(set, now) then
+                local meta = ensureText(set, "ForcefieldText", healthOrange)
+                setText(meta, "Forcefield", textSize, healthOrange)
+                stacked[#stacked + 1] = meta
+            elseif set.ForcefieldText then
+                setVisible(set.ForcefieldText.Object, false)
+            end
+
+            local textColor = ESP.TextColor
+            local tracerColor = ESP.TracerColor
+            if ESP.TeamColorEnabled and player.Team then
+                textColor = player.Team.TeamColor.Color
+                tracerColor = textColor
+            end
+
+            if ESP.ItemEnabled then
+                local itemText = getCharacterItems(set, now)
+                if itemText then
+                    local meta = ensureText(set, "ItemText", textColor)
+                    setText(meta, itemText, textSize, textColor)
+                    stacked[#stacked + 1] = meta
+                elseif set.ItemText then
+                    setVisible(set.ItemText.Object, false)
+                end
+            elseif set.ItemText then
+                setVisible(set.ItemText.Object, false)
+            end
+
+            if ESP.TeamIndicatorEnabled then
+                local teamText = player.Team and player.Team.Name or "Neutral"
+                local teamColor = player.Team and player.Team.TeamColor.Color or ESP.TextColor
+                local meta = ensureText(set, "TeamText", teamColor)
+                setText(meta, teamText, textSize, teamColor)
+                stacked[#stacked + 1] = meta
+            elseif set.TeamText then
+                setVisible(set.TeamText.Object, false)
+            end
+
+            if ESP.DistanceEnabled then
+                distance = distance or math.floor((cameraPosition - root.Position).Magnitude)
+                local meta = ensureText(set, "DistanceText", textColor)
+                setText(meta, tostring(distance) .. "m", textSize, textColor)
+                stacked[#stacked + 1] = meta
+            elseif set.DistanceText then
+                setVisible(set.DistanceText.Object, false)
+            end
+
+            local totalHeight = 0
+            for _, meta in ipairs(stacked) do
+                totalHeight += (meta.Bounds and meta.Bounds.Y or meta.Object.TextBounds.Y)
+            end
+            totalHeight += gap * math.max(0, #stacked - 1)
+
+            local currentY = (minY + maxY) * 0.5 - totalHeight * 0.5
+            for _, meta in ipairs(stacked) do
+                local bounds = meta.Bounds or meta.Object.TextBounds
+                setTextPosition(
+                    meta,
+                    rightX + bounds.X * 0.5,
+                    currentY + bounds.Y * 0.5
+                )
+                currentY += bounds.Y + gap
+            end
+
+            local healthAlpha
+            if ESP.HealthBarEnabled or ESP.HealthTextEnabled then
+                healthAlpha = math.clamp(
+                    humanoid.Health / math.max(humanoid.MaxHealth, 1),
+                    0,
+                    1
+                )
+            end
+
+            local barWidth = math.max(2, 3 * scale)
+            local barX = minX - barWidth - 5 * scale
+            if ESP.HealthBarEnabled then
+                local height = maxY - minY
+                local outline = ensureSquare(set, "HealthBarOutline", true, black, 1, 1)
+                local fill = ensureSquare(set, "HealthBarFill", true, healthFull, 1, 1)
+                setSquare(outline, barX - 1, minY - 1, barWidth + 2, height + 2, black)
+                local fillHeight = height * healthAlpha
+                setSquare(
+                    fill,
+                    barX,
+                    maxY - fillHeight,
+                    barWidth,
+                    fillHeight,
+                    healthColor(healthAlpha)
+                )
+            else
+                setVisible(set.HealthBarOutline, false)
+                setVisible(set.HealthBarFill, false)
+            end
+
+            if ESP.HealthTextEnabled then
+                local color = healthColor(healthAlpha)
+                local meta = ensureText(set, "HealthText", color)
+                local healthValue = math.floor(humanoid.Health)
+                local bounds = setText(
+                    meta,
+                    "[" .. healthValue .. "]",
+                    textSize,
+                    color
+                )
+                setTextPosition(
+                    meta,
+                    barX - bounds.X * 0.5 - 4 * scale,
+                    (minY + maxY) * 0.5
+                )
+            elseif set.HealthText then
+                setVisible(set.HealthText.Object, false)
             end
         else
-            set.ItemText.Visible = false
-        end
-
-        if ESP.TeamIndicatorEnabled then
-            set.TeamText.Size = math.max(6, math.floor(13 * scale))
-            set.TeamText.Text = player.Team and player.Team.Name or "Neutral"
-            set.TeamText.Color = player.Team and player.Team.TeamColor.Color or ESP.TextColor
-            set.TeamText.Visible = true
-            table.insert(stacked, set.TeamText)
-        else
-            set.TeamText.Visible = false
-        end
-
-        if ESP.DistanceEnabled then
-            set.DistanceText.Size = math.max(6, math.floor(13 * scale))
-            set.DistanceText.Text = tostring(distance) .. "m"
-            set.DistanceText.Color = textColor
-            set.DistanceText.Visible = true
-            table.insert(stacked, set.DistanceText)
-        else
-            set.DistanceText.Visible = false
-        end
-
-        local totalHeight = 0
-        for _, textObject in ipairs(stacked) do
-            totalHeight += textObject.TextBounds.Y
-        end
-        totalHeight += gap * math.max(0, #stacked - 1)
-        local currentY = (minimum.Y + maximum.Y) * 0.5 - totalHeight * 0.5
-        for _, textObject in ipairs(stacked) do
-            local bounds = textObject.TextBounds
-            textObject.Position = Vector2.new(
-                rightX + bounds.X * 0.5,
-                currentY + bounds.Y * 0.5
-            )
-            currentY += bounds.Y + gap
-        end
-
-        local healthAlpha = math.clamp(
-            humanoid.Health / math.max(humanoid.MaxHealth, 1),
-            0,
-            1
-        )
-        local barWidth = math.max(2, 3 * scale)
-        local barX = minimum.X - barWidth - 5 * scale
-        if ESP.HealthBarEnabled then
-            -- One solid black backing rectangle acts as both the border and the
-            -- empty-health background. The fill sits directly one pixel inside
-            -- it, so there is no floating gap between the outline and bar.
-            set.HealthBarOutline.Size = Vector2.new(barWidth + 2, height + 2)
-            set.HealthBarOutline.Position = Vector2.new(barX - 1, minimum.Y - 1)
-            set.HealthBarOutline.Visible = true
-            set.HealthBarBack.Visible = false
-            local fillHeight = height * healthAlpha
-            set.HealthBarFill.Size = Vector2.new(barWidth, fillHeight)
-            set.HealthBarFill.Position = Vector2.new(barX, maximum.Y - fillHeight)
-            set.HealthBarFill.Color = healthColor(healthAlpha)
-            set.HealthBarFill.Visible = true
-        else
-            set.HealthBarOutline.Visible = false
-            set.HealthBarBack.Visible = false
-            set.HealthBarFill.Visible = false
-        end
-
-        if ESP.HealthTextEnabled then
-            set.HealthText.Size = math.max(6, math.floor(13 * scale))
-            set.HealthText.Text = "[" .. math.floor(humanoid.Health) .. "]"
-            set.HealthText.Color = healthColor(healthAlpha)
-            set.HealthText.Position = Vector2.new(
-                barX - set.HealthText.TextBounds.X * 0.5 - 4 * scale,
-                (minimum.Y + maximum.Y) * 0.5
-            )
-            set.HealthText.Visible = true
-        else
-            set.HealthText.Visible = false
+            -- Tracer-only mode skips all body-part bounds/projection work.
+            setVisible(set.Box, false)
+            setVisible(set.BoxOutline, false)
+            setVisible(set.BoxFill, false)
+            if set.NameText then setVisible(set.NameText.Object, false) end
+            if set.HostileText then setVisible(set.HostileText.Object, false) end
+            if set.ForcefieldText then setVisible(set.ForcefieldText.Object, false) end
+            if set.ItemText then setVisible(set.ItemText.Object, false) end
+            if set.TeamText then setVisible(set.TeamText.Object, false) end
+            if set.DistanceText then setVisible(set.DistanceText.Object, false) end
+            if set.HealthText then setVisible(set.HealthText.Object, false) end
+            setVisible(set.HealthBarOutline, false)
+            setVisible(set.HealthBarFill, false)
         end
 
         if ESP.TracersEnabled then
-            local targetScreen, targetVisible = worldToScreen(root.Position)
+            local targetX = rootPoint.X
+            local targetY = rootPoint.Y
+            local targetVisible = rootPoint.Z > 0
+            local tracerColor = ESP.TracerColor
+            if ESP.TeamColorEnabled and player.Team then
+                tracerColor = player.Team.TeamColor.Color
+            end
+
             if targetVisible then
-                if ESP.TracerType == "Body" then
-                    if bodyTracerFrom then
-                        set.BodyTracer.From = bodyTracerFrom
-                        set.BodyTracer.To = targetScreen
-                        set.BodyTracer.Color = tracerColor
-                        set.BodyTracer.Visible = true
-                    else
-                        set.BodyTracer.Visible = false
+                if ESP.TracerType == "Body" and bodyFromX then
+                    local line = set.BodyTracer
+                    if not line then
+                        line = createLine(tracerColor, 1.5, 1)
+                        set.BodyTracer = line
                     end
+                    setLine(line, bodyFromX, bodyFromY, targetX, targetY, 1.5, tracerColor)
                 else
-                    set.BodyTracer.Visible = false
+                    setVisible(set.BodyTracer, false)
                 end
 
-                set.TracerMouse.Visible = ESP.TracerType == "Mouse"
-                if set.TracerMouse.Visible then
-                    set.TracerMouse.From = mousePosition
-                    set.TracerMouse.To = targetScreen
-                    set.TracerMouse.Color = tracerColor
+                if ESP.TracerType == "Mouse" then
+                    local line = set.TracerMouse
+                    if not line then
+                        line = createLine(tracerColor, 1.5, 1)
+                        set.TracerMouse = line
+                    end
+                    setLine(line, mouseX, mouseY, targetX, targetY, 1.5, tracerColor)
+                else
+                    setVisible(set.TracerMouse, false)
                 end
 
-                set.TracerTop.Visible = ESP.TracerType == "Top"
-                if set.TracerTop.Visible then
-                    set.TracerTop.From = Vector2.new(viewport.X * 0.5, 0)
-                    set.TracerTop.To = targetScreen
-                    set.TracerTop.Color = tracerColor
+                if ESP.TracerType == "Top" then
+                    local line = set.TracerTop
+                    if not line then
+                        line = createLine(tracerColor, 1.5, 1)
+                        set.TracerTop = line
+                    end
+                    setLine(line, viewport.X * 0.5, 0, targetX, targetY, 1.5, tracerColor)
+                else
+                    setVisible(set.TracerTop, false)
                 end
 
-                set.TracerBottom.Visible = ESP.TracerType == "Bottom"
-                if set.TracerBottom.Visible then
-                    set.TracerBottom.From = Vector2.new(viewport.X * 0.5, viewport.Y)
-                    set.TracerBottom.To = targetScreen
-                    set.TracerBottom.Color = tracerColor
+                if ESP.TracerType == "Bottom" then
+                    local line = set.TracerBottom
+                    if not line then
+                        line = createLine(tracerColor, 1.5, 1)
+                        set.TracerBottom = line
+                    end
+                    setLine(
+                        line,
+                        viewport.X * 0.5,
+                        viewport.Y,
+                        targetX,
+                        targetY,
+                        1.5,
+                        tracerColor
+                    )
+                else
+                    setVisible(set.TracerBottom, false)
                 end
             else
-                set.BodyTracer.Visible = false
-                set.TracerMouse.Visible = false
-                set.TracerTop.Visible = false
-                set.TracerBottom.Visible = false
+                setVisible(set.BodyTracer, false)
+                setVisible(set.TracerMouse, false)
+                setVisible(set.TracerTop, false)
+                setVisible(set.TracerBottom, false)
             end
         else
-            set.BodyTracer.Visible = false
-            set.TracerMouse.Visible = false
-            set.TracerTop.Visible = false
-            set.TracerBottom.Visible = false
+            setVisible(set.BodyTracer, false)
+            setVisible(set.TracerMouse, false)
+            setVisible(set.TracerTop, false)
+            setVisible(set.TracerBottom, false)
         end
     end
 end)
@@ -6572,21 +6924,10 @@ connect(Players.PlayerRemoving, function(player)
     end
 
     local set = ESP.Drawings[player]
-    if not set then
-        return
+    if set then
+        destroySet(set)
+        ESP.Drawings[player] = nil
     end
-    for _, drawing in pairs(set) do
-        if typeof(drawing) == "table" and drawing._GuiDrawing then
-            drawing:Remove()
-        elseif typeof(drawing) == "table" then
-            for _, nested in ipairs(drawing) do
-                nested:Remove()
-            end
-        else
-            drawing:Remove()
-        end
-    end
-    ESP.Drawings[player] = nil
 end)
 end
 
@@ -6599,20 +6940,15 @@ Visual.Layout.Right = 0
 Visual.Frame.CanvasSize = UDim2.fromOffset(0, 0)
 
 local VisualMain = makeTitledSection(Visual, "Left", "Main")
-rememberToggle(VisualMain:Toggle({
-    Name = "Username",
-    Default = false,
+VisualMain:Dropdown({
+    Name = "Name",
+    Options = {"Display Name", "Username", "Both", "Off"},
+    Default = "Display Name",
     Callback = function(value)
-        ESP.NameEnabled = value
+        ESP.NameEnabled = value == "Username" or value == "Both"
+        ESP.DisplayNameEnabled = value == "Display Name" or value == "Both"
     end,
-}))
-rememberToggle(VisualMain:Toggle({
-    Name = "Display Name",
-    Default = false,
-    Callback = function(value)
-        ESP.DisplayNameEnabled = value
-    end,
-}))
+})
 rememberToggle(VisualMain:Toggle({
     Name = "Team",
     Default = false,
@@ -6878,7 +7214,7 @@ PlayerSpin:Slider({
     Default = State.SpinSpeed,
     Decimals = 0,
     Callback = function(value)
-        State.SpinSpeed = math.floor(value + 0.5)
+        PlayerFeatures.SetSpinSpeed(value)
     end,
 })
 
@@ -7044,17 +7380,17 @@ tweenSpeedUpdate = function(speed)
 end
 tweenSpeedUpdate(State.TweenSpeed)
 
-connect(RunService.Heartbeat, function()
-    if runtimeAlive and fill and fill.Parent then
-        fill.BackgroundColor3 = currentTweenColor
+task.spawn(function()
+    while runtimeAlive and fill and fill.Parent do
         if stockSpeedMarker and stockSpeedMarker.Parent then
             stockSpeedMarker.BackgroundColor3 = track.BackgroundColor3
         end
+        task.wait(0.25)
     end
 end)
 end
 
-local VFlySection = makeTitledSection(MovementPage, "Right", "Vehicle Fly")
+local VFlySection = makeTitledSection(MovementPage, "Right", "V Fly")
 local vFlyToggleControl = rememberToggle(VFlySection:Toggle({
     Name = "Toggle",
     Default = State.VFly,
@@ -7171,11 +7507,7 @@ vFlySpeedUpdate = function(speed)
 end
 vFlySpeedUpdate(State.VFlySpeed)
 
-connect(RunService.Heartbeat, function()
-    if runtimeAlive and fill and fill.Parent then
-        fill.BackgroundColor3 = currentVFlyColor
-    end
-end)
+-- Slider color is updated only when the value changes; no per-frame UI write.
 end
 MovementFeatures.SetVFlySpeed(50)
 
@@ -7183,13 +7515,20 @@ local MovementSpeedSection = makeTitledSection(MovementPage, "Right", "Speed")
 MovementSpeedSection:Slider({
     Name = "Walk Speed",
     Minimum = 16,
-    Maximum = 32,
+    Maximum = 33,
     Default = State.WalkSpeed,
     Decimals = 0,
     Callback = function(value)
         MovementFeatures.SetWalkSpeed(value)
     end,
 })
+rememberToggle(MovementSpeedSection:Toggle({
+    Name = "Auto Bhop",
+    Default = State.AutoBhop,
+    Callback = function(value)
+        MovementFeatures.SetAutoBhop(value)
+    end,
+}))
 MovementFeatures.SetWalkSpeed(State.WalkSpeed)
 
 local WorldPage = Consist:Page("World")
@@ -7441,6 +7780,7 @@ local function cleanup()
     if not runtimeAlive then
         return
     end
+    runtimeAlive = false
     if fastShootCleanup then
         pcall(fastShootCleanup)
     end
@@ -7459,7 +7799,6 @@ local function cleanup()
     if WorldFeatures.Cleanup then
         pcall(WorldFeatures.Cleanup)
     end
-    runtimeAlive = false
     closeCompactModeMenu()
     if wallBCleanup then
         pcall(wallBCleanup)
