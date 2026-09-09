@@ -115,6 +115,7 @@ local State = {
     WalkSpeed = 16,
     SpeedMode = "Direct",
     AutoBhop = false,
+    AutoBhopBind = Enum.KeyCode.Unknown,
     VFly = false,
     VFlyBind = Enum.KeyCode.Unknown,
     VFlySpeed = 50,
@@ -333,10 +334,20 @@ fastShootCleanup = function()
     end
 end
 
+local setAutoReloadEnabled
 do
 local autoReloadConnections = {}
+local autoReloadCharacterConnections = {}
 local autoReloadToolConnections = {}
+local autoReloadHudConnection
 local autoReloadLastFire = 0
+local reloadKeyPress
+local reloadKeyRelease
+
+pcall(function()
+    reloadKeyPress = environment.keypress or keypress
+    reloadKeyRelease = environment.keyrelease or keyrelease
+end)
 
 local function disconnectAutoReloadList(list)
     for _, connection in ipairs(list) do
@@ -347,36 +358,58 @@ local function disconnectAutoReloadList(list)
     table.clear(list)
 end
 
+local function disconnectAutoReloadHud()
+    if autoReloadHudConnection then
+        pcall(function()
+            autoReloadHudConnection:Disconnect()
+        end)
+        autoReloadHudConnection = nil
+    end
+end
+
+local function currentReloadTool()
+    local character = LocalPlayer.Character
+    return character and character:FindFirstChildOfClass("Tool") or nil
+end
+
+local function currentReloadAmmo(tool)
+    if not tool then
+        return nil
+    end
+    local ammo = tool:GetAttribute("Local_CurrentAmmo")
+    if type(ammo) ~= "number" then
+        ammo = tool:GetAttribute("CurrentAmmo")
+    end
+    return type(ammo) == "number" and ammo or nil
+end
+
 local function fireReloadKey()
     if not State.AutoReload or UserInputService:GetFocusedTextBox() then
         return
     end
-    if os.clock() - autoReloadLastFire < 0.20 then
+    if os.clock() - autoReloadLastFire < 0.15 then
         return
     end
 
-    local character = LocalPlayer.Character
-    local tool = character and character:FindFirstChildOfClass("Tool")
-    if not tool then
+    local tool = currentReloadTool()
+    local ammo = currentReloadAmmo(tool)
+    if not tool or ammo == nil or ammo > 0 then
         return
     end
 
-    local ammo = tool:GetAttribute("Local_CurrentAmmo")
-    if ammo == nil then
-        ammo = tool:GetAttribute("CurrentAmmo")
-    end
-    if type(ammo) ~= "number" or ammo > 0 then
+    if type(reloadKeyPress) ~= "function" or type(reloadKeyRelease) ~= "function" then
         return
     end
 
-    if type(keypress) == "function" and type(keyrelease) == "function" then
-        autoReloadLastFire = os.clock()
-        task.spawn(function()
-            pcall(keypress, 0x52)
-            task.wait(0.05)
-            pcall(keyrelease, 0x52)
-        end)
-    end
+    autoReloadLastFire = os.clock()
+    task.spawn(function()
+        if not runtimeAlive or not State.AutoReload then
+            return
+        end
+        pcall(reloadKeyPress, 0x52)
+        task.wait(0.05)
+        pcall(reloadKeyRelease, 0x52)
+    end)
 end
 
 local function bindAutoReloadTool(tool)
@@ -384,22 +417,35 @@ local function bindAutoReloadTool(tool)
     if not State.AutoReload or not tool or not tool:IsA("Tool") then
         return
     end
+
     for _, attribute in ipairs({"Local_CurrentAmmo", "CurrentAmmo"}) do
         autoReloadToolConnections[#autoReloadToolConnections + 1] =
-            tool:GetAttributeChangedSignal(attribute):Connect(fireReloadKey)
+            tool:GetAttributeChangedSignal(attribute):Connect(function()
+                task.defer(fireReloadKey)
+            end)
     end
+
     task.defer(fireReloadKey)
 end
 
-local function bindAutoReloadHud()
+local function findAutoReloadLabel()
     local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
     local home = playerGui and playerGui:FindFirstChild("Home")
     local hud = home and home:FindFirstChild("hud")
     local bottom = hud and hud:FindFirstChild("BottomRightFrame")
     local frame = bottom and bottom:FindFirstChild("GunFrame")
-    local label = frame and frame:FindFirstChild("BulletsLabel")
+    return frame and frame:FindFirstChild("BulletsLabel") or nil
+end
+
+local function bindAutoReloadHud()
+    disconnectAutoReloadHud()
+    if not State.AutoReload then
+        return
+    end
+
+    local label = findAutoReloadLabel()
     if label and label:IsA("TextLabel") then
-        autoReloadConnections[#autoReloadConnections + 1] = label:GetPropertyChangedSignal("Text"):Connect(function()
+        autoReloadHudConnection = label:GetPropertyChangedSignal("Text"):Connect(function()
             if State.AutoReload and label.Text ~= "..." then
                 task.defer(fireReloadKey)
             end
@@ -408,51 +454,79 @@ local function bindAutoReloadHud()
 end
 
 local function bindAutoReloadCharacter(character)
+    disconnectAutoReloadList(autoReloadCharacterConnections)
+    disconnectAutoReloadList(autoReloadToolConnections)
+
     if not State.AutoReload then
         return
     end
-    bindAutoReloadTool(character and character:FindFirstChildOfClass("Tool"))
+
     if character then
-        autoReloadConnections[#autoReloadConnections + 1] = character.ChildAdded:Connect(function(object)
-            if object:IsA("Tool") then
-                bindAutoReloadTool(object)
-            end
-        end)
-        autoReloadConnections[#autoReloadConnections + 1] = character.ChildRemoved:Connect(function(object)
-            if object:IsA("Tool") then
-                task.defer(function()
-                    if runtimeAlive and State.AutoReload then
-                        bindAutoReloadTool(character:FindFirstChildOfClass("Tool"))
-                    end
-                end)
-            end
-        end)
+        autoReloadCharacterConnections[#autoReloadCharacterConnections + 1] =
+            character.ChildAdded:Connect(function(object)
+                if object:IsA("Tool") then
+                    bindAutoReloadTool(object)
+                    task.defer(fireReloadKey)
+                end
+            end)
+
+        autoReloadCharacterConnections[#autoReloadCharacterConnections + 1] =
+            character.ChildRemoved:Connect(function(object)
+                if object:IsA("Tool") then
+                    task.defer(function()
+                        if runtimeAlive and State.AutoReload then
+                            bindAutoReloadTool(character:FindFirstChildOfClass("Tool"))
+                        end
+                    end)
+                end
+            end)
     end
+
+    bindAutoReloadTool(character and character:FindFirstChildOfClass("Tool"))
 end
 
-local function setAutoReloadEnabled(enabled)
+setAutoReloadEnabled = function(enabled)
     State.AutoReload = enabled == true
+
     disconnectAutoReloadList(autoReloadConnections)
+    disconnectAutoReloadList(autoReloadCharacterConnections)
     disconnectAutoReloadList(autoReloadToolConnections)
+    disconnectAutoReloadHud()
+
     if not State.AutoReload then
         return
     end
 
-    bindAutoReloadHud()
     bindAutoReloadCharacter(LocalPlayer.Character)
-    autoReloadConnections[#autoReloadConnections + 1] = LocalPlayer.CharacterAdded:Connect(function(character)
-        task.defer(function()
-            if runtimeAlive and State.AutoReload then
-                disconnectAutoReloadList(autoReloadToolConnections)
-                bindAutoReloadCharacter(character)
-                bindAutoReloadHud()
-            end
+    bindAutoReloadHud()
+
+    autoReloadConnections[#autoReloadConnections + 1] =
+        LocalPlayer.CharacterAdded:Connect(function(character)
+            task.defer(function()
+                if runtimeAlive and State.AutoReload then
+                    bindAutoReloadCharacter(character)
+                    bindAutoReloadHud()
+                end
+            end)
         end)
-    end)
+
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if playerGui then
+        autoReloadConnections[#autoReloadConnections + 1] =
+            playerGui.DescendantAdded:Connect(function(object)
+                if State.AutoReload and object.Name == "BulletsLabel" then
+                    task.defer(bindAutoReloadHud)
+                end
+            end)
+    end
+
+    task.defer(fireReloadKey)
 end
 
 autoReloadCleanup = function()
-    setAutoReloadEnabled(false)
+    if setAutoReloadEnabled then
+        setAutoReloadEnabled(false)
+    end
 end
 end
 
@@ -1480,85 +1554,144 @@ local function setAntiRiotShieldEnabled(enabled)
     end)
 end
 
-local function disconnectPickupConnections()
-    for _, connection in ipairs(pickupConnections) do
-        pcall(function()
-            connection:Disconnect()
-        end)
+local AutoPickup = {
+    Enabled = false,
+    _conns = {},
+    items = {},
+    pickupList = {Guard = {}, Prisoner = {}, Criminal = {}}
+}
+
+local function addAutoPickupItem(pickup)
+    if typeof(pickup) == "Instance"
+        and pickup:IsA("Model")
+        and pickup.Name ~= "Model"
+        and pickup:GetAttribute("ToolName") then
+        for _, value in ipairs(AutoPickup.items) do
+            if value[1] == pickup then
+                return
+            end
+        end
+
+        table.insert(AutoPickup.items, {
+            pickup,
+            pickup.Name == "TouchGiver"
+        })
     end
-    table.clear(pickupConnections)
 end
 
-local function registerPickup(object)
-    if object:IsA("Model") and object:GetAttribute("ToolName") then
-        pickupItems[object] = true
+local function removeAutoPickupItem(pickup)
+    for index, data in ipairs(AutoPickup.items) do
+        if data[1] == pickup then
+            table.remove(AutoPickup.items, index)
+            break
+        end
     end
 end
 
-local function setAutoPickupEnabled(enabled)
-    State.AutoPickup = enabled == true
-    pickupGeneration += 1
-    local generation = pickupGeneration
-    disconnectPickupConnections()
-    table.clear(pickupItems)
-    if not State.AutoPickup then
+local function getAutoPickupTeamName()
+    if not LocalPlayer.Team then
+        return "Prisoner"
+    end
+
+    local teamName = LocalPlayer.Team.Name
+    if teamName == "Guard" or teamName == "Guards" then
+        return "Guard"
+    end
+    if teamName == "Criminal" or teamName == "Criminals" then
+        return "Criminal"
+    end
+    return "Prisoner"
+end
+
+function AutoPickup:Toggle(state)
+    self.Enabled = state == true
+    State.AutoPickup = self.Enabled
+
+    if not self.Enabled then
+        for _, connection in ipairs(self._conns) do
+            pcall(function()
+                connection:Disconnect()
+            end)
+        end
+        self._conns = {}
+        self.items = {}
         return
     end
 
-    table.insert(pickupConnections, workspace.DescendantAdded:Connect(registerPickup))
-    table.insert(pickupConnections, workspace.DescendantRemoving:Connect(function(object)
-        pickupItems[object] = nil
-    end))
+    for _, child in ipairs(workspace:GetDescendants()) do
+        task.spawn(addAutoPickupItem, child)
+    end
 
-    -- Build the initial pickup index incrementally instead of walking the whole
-    -- workspace in one frame.
-    task.spawn(function()
-        local descendants = workspace:GetDescendants()
-        for index, object in ipairs(descendants) do
-            if not runtimeAlive
-                or not State.AutoPickup
-                or generation ~= pickupGeneration then
-                break
-            end
-            registerPickup(object)
-            if index % 100 == 0 then
-                task.wait()
-            end
-        end
-    end)
+    table.insert(self._conns, workspace.ChildAdded:Connect(addAutoPickupItem))
+    table.insert(self._conns, workspace.ChildRemoved:Connect(removeAutoPickupItem))
 
     task.spawn(function()
-        while runtimeAlive and State.AutoPickup and generation == pickupGeneration do
+        while runtimeAlive and self.Enabled do
             local character = LocalPlayer.Character
             local root = character and character:FindFirstChild("HumanoidRootPart")
             local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
-            local remotes = ReplicatedStorage:FindFirstChild("Remotes")
-            local giverPressed = remotes and remotes:FindFirstChild("GiverPressed")
-            if not giverPressed then
-                giverPressed = ReplicatedStorage:FindFirstChild("GiverPressed", true)
-            end
-            if root and backpack and giverPressed then
-                for pickup in pairs(pickupItems) do
-                    if pickup and pickup.Parent then
-                        local primary = pickup.PrimaryPart or pickup:FindFirstChildWhichIsA("BasePart", true)
-                        local toolName = pickup:GetAttribute("ToolName")
-                        if primary
-                            and type(toolName) == "string"
-                            and not backpack:FindFirstChild(toolName)
-                            and not (character and character:FindFirstChild(toolName)) then
-                            local delta = primary.Position - root.Position
-                            if delta:Dot(delta) < 144 then
+
+            if root and backpack then
+                local localPosition = root.Position
+
+                for _, pickup in ipairs(self.items) do
+                    local model = pickup[1]
+                    if model and model.Parent and model.PrimaryPart
+                        and (model.PrimaryPart.Position - localPosition).Magnitude < 12 then
+                        local tool = model:GetAttribute("ToolName")
+
+                        if pickup[2] then
+                            local teamName = getAutoPickupTeamName()
+                            local list = self.pickupList[teamName]
+                            local found = false
+
+                            for _, entry in pairs(list) do
+                                if not backpack:FindFirstChild(entry) then
+                                    found = tool ~= entry
+                                    break
+                                end
+                            end
+
+                            if found then
+                                continue
+                            end
+                        end
+
+                        if type(tool) == "string"
+                            and not backpack:FindFirstChild(tool)
+                            and not (character and character:FindFirstChild(tool)) then
+                            local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+                            local giverPressed = remotes and remotes:FindFirstChild("GiverPressed")
+                            if giverPressed then
                                 pcall(function()
-                                    giverPressed:FireServer(pickup)
+                                    giverPressed:FireServer(model)
                                 end)
                             end
                         end
                     end
                 end
             end
+
             task.wait(0.05)
         end
     end)
+end
+
+function AutoPickup:SetTeamList(teamName, list)
+    self.pickupList[teamName] = {}
+    for _, entry in ipairs(list) do
+        local data = string.split(entry, "/")
+        local index = tonumber(data[1])
+        self.pickupList[teamName][index or 999] = data[2]
+    end
+end
+
+function AutoPickup:Unload()
+    self:Toggle(false)
+end
+
+local function setAutoPickupEnabled(enabled)
+    AutoPickup:Toggle(enabled)
 end
 
 local function restoreFenceParts()
@@ -2116,6 +2249,25 @@ local function setAutoBhopEnabled(enabled)
     refreshSpeedRuntime()
 end
 
+connect(UserInputService.InputBegan, function(input, processed)
+    if processed
+        or activeCapture
+        or State.CapturedBindingInput == input
+        or UserInputService:GetFocusedTextBox()
+        or inputIsOverApp(input)
+        or not inputMatches(input, State.AutoBhopBind) then
+        return
+    end
+
+    local enabled = not State.AutoBhop
+    setAutoBhopEnabled(enabled)
+
+    local control = MovementFeatures.AutoBhopToggleControl
+    if control then
+        control:Set(enabled, true)
+    end
+end)
+
 local VFLY_UI_TO_RUNTIME_SCALE = 0.15
 
 local function vFlyRuntimeSpeed(uiSpeed)
@@ -2170,6 +2322,9 @@ end
 MovementFeatures.SetWalkSpeed = setWalkSpeed
 MovementFeatures.SetSpeedMode = setSpeedMode
 MovementFeatures.SetAutoBhop = setAutoBhopEnabled
+MovementFeatures.SetAutoBhopBind = function(binding)
+    State.AutoBhopBind = binding
+end
 MovementFeatures.SetVFly = setVFlyEnabled
 MovementFeatures.SetVFlyBind = function(binding)
     State.VFlyBind = binding
@@ -3612,6 +3767,41 @@ local function releaseTriggerInput()
     end
 end
 
+local function holdTriggerInput(gun)
+    if triggerBPressed then
+        return
+    end
+
+    if type(triggerMousePress) == "function" and type(triggerMouseRelease) == "function" then
+        triggerBPressed = true
+        pcall(triggerMousePress)
+        return
+    end
+
+    if triggerVirtualInput then
+        local position = UserInputService:GetMouseLocation()
+        triggerBPressed = true
+        pcall(function()
+            triggerVirtualInput:SendMouseButtonEvent(
+                math.floor(position.X),
+                math.floor(position.Y),
+                0,
+                true,
+                game,
+                0
+            )
+        end)
+        return
+    end
+
+    if gun then
+        triggerBPressed = true
+        pcall(function()
+            gun:Activate()
+        end)
+    end
+end
+
 local function fireTriggerInput(gun)
     if type(triggerMouseClick) == "function" then
         pcall(triggerMouseClick)
@@ -3651,10 +3841,14 @@ local function fireTriggerInput(gun)
     end
 
     if gun then
-        pcall(function() gun:Activate() end)
+        pcall(function()
+            gun:Activate()
+        end)
         task.delay(0.012, function()
             if gun and gun.Parent then
-                pcall(function() gun:Deactivate() end)
+                pcall(function()
+                    gun:Deactivate()
+                end)
             end
         end)
     end
@@ -3713,6 +3907,20 @@ setTriggerBEnabled = function(enabled)
             return
         end
 
+        -- With Fast Shoot enabled, Trigger Bot should use the weapon's
+        -- full-auto path instead of synthesizing a new click every shot.
+        if State.FastShoot then
+            local targetPlayer, targetPart = triggerBTarget()
+            if not targetPlayer or not targetPart then
+                stopTriggerBGun()
+                return
+            end
+
+            triggerBLastGun = gun
+            holdTriggerInput(gun)
+            return
+        end
+
         local fireRate = gun:GetAttribute("FireRate")
         if type(fireRate) ~= "number" or fireRate <= 0 then
             fireRate = 0.12
@@ -3724,8 +3932,7 @@ setTriggerBEnabled = function(enabled)
             return
         end
 
-        -- Target acquisition is the expensive part. Only do it on frames where
-        -- the weapon is actually ready to fire instead of rescanning every frame.
+        -- Normal Trigger Bot keeps the one-click-per-shot behavior.
         local targetPlayer, targetPart = triggerBTarget()
         if not targetPlayer or not targetPart then
             stopTriggerBGun()
@@ -4419,18 +4626,19 @@ rememberToggle(WallBSection:Toggle({
 }))
 
 rememberToggle(WallBSection:Toggle({
-    Name = "Trigger B",
-    Default = false,
-    Callback = function(value)
-        setTriggerBEnabled(value)
-    end,
-}))
-
-rememberToggle(WallBSection:Toggle({
     Name = "Fast Shoot",
     Default = false,
     Callback = function(value)
         setFastShootEnabled(value)
+    end,
+}))
+
+local TriggerBotSection = makeTitledSection(Combat, "Right", "Trigger Bot")
+rememberToggle(TriggerBotSection:Toggle({
+    Name = "Trigger Bot",
+    Default = false,
+    Callback = function(value)
+        setTriggerBEnabled(value)
     end,
 }))
 
@@ -4575,9 +4783,9 @@ connect(LocalPlayer:GetPropertyChangedSignal("Team"), function()
 end)
 
 local baseWallBY = WallBSection.Y
+local baseTriggerBotY = TriggerBotSection.Y
 local baseChecksY = ChecksSection.Y
 local adaptiveLayoutExtra = 0
-local fastShootLayoutExtra = 0
 
 local function moveRightSection(section, targetY)
     section.Y = targetY
@@ -4595,10 +4803,8 @@ end
 
 local function refreshRightSectionLayout()
     moveRightSection(WallBSection, baseWallBY + adaptiveLayoutExtra)
-    moveRightSection(
-        ChecksSection,
-        baseChecksY + adaptiveLayoutExtra + fastShootLayoutExtra
-    )
+    moveRightSection(TriggerBotSection, baseTriggerBotY + adaptiveLayoutExtra)
+    moveRightSection(ChecksSection, baseChecksY + adaptiveLayoutExtra)
     local bottom = ChecksSection.Y + ChecksSection.ContentHeight + 10
     Combat.Layout.Right = bottom
     Combat.Frame.CanvasSize = UDim2.fromOffset(0, math.max(Combat.Layout.Left, bottom))
@@ -7671,13 +7877,41 @@ MovementSpeedSection:Slider({
         MovementFeatures.SetWalkSpeed(value)
     end,
 })
-rememberToggle(MovementSpeedSection:Toggle({
+local autoBhopToggleControl = rememberToggle(MovementSpeedSection:Toggle({
     Name = "Auto Bhop",
     Default = State.AutoBhop,
     Callback = function(value)
         MovementFeatures.SetAutoBhop(value)
     end,
 }))
+MovementFeatures.AutoBhopToggleControl = autoBhopToggleControl
+
+local autoBhopKeybindDisplay
+local autoBhopKeybindControl = MovementSpeedSection:Keybind({
+    Name = "Keybind",
+    Default = State.AutoBhopBind,
+    ResetValue = function()
+        return Enum.KeyCode.Unknown
+    end,
+    Callback = function(value)
+        MovementFeatures.SetAutoBhopBind(value)
+        if autoBhopKeybindDisplay then
+            task.defer(function()
+                if runtimeAlive and autoBhopKeybindDisplay then
+                    autoBhopKeybindDisplay:Set(value)
+                end
+            end)
+        end
+    end,
+})
+autoBhopKeybindDisplay = installExternalKeybind(
+    autoBhopKeybindControl,
+    State.AutoBhopBind,
+    function(value)
+        MovementFeatures.SetAutoBhopBind(value)
+    end
+)
+
 MovementFeatures.SetSpeedMode(State.SpeedMode)
 MovementFeatures.SetWalkSpeed(State.WalkSpeed)
 end
