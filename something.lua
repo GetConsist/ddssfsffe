@@ -89,6 +89,8 @@ local State = {
     AutoSwap = false,
     AutoReload = false,
     TriggerB = false,
+    StickyAim = false,
+    StickyMode = "Retarget",
     SemiAutomatic = false,
     SemiAutomaticActive = false,
     SemiAutomaticBind = Enum.KeyCode.Unknown,
@@ -138,6 +140,7 @@ local State = {
 
 local camTarget
 local mouseTarget
+local stickyTarget
 local modeToggleControl
 local modeKeybindDisplay
 local heldMode
@@ -3386,6 +3389,7 @@ local TargetRuntime
 local function clearTargets()
     camTarget = nil
     mouseTarget = nil
+    stickyTarget = nil
     table.clear(adaptivePartCache)
     if TargetRuntime and TargetRuntime.ClearSilent then
         TargetRuntime:ClearSilent()
@@ -3600,9 +3604,13 @@ connect(Players.PlayerRemoving, function(player)
     if index then
         table.remove(targetPlayerList, index)
     end
+    if stickyTarget == player then
+        stickyTarget = nil
+        TargetRuntime:ClearSilent()
+    end
 end)
 
-local function findTarget(screenAnchor, ignoreWallCheck)
+local function findBestTarget(screenAnchor, ignoreWallCheck, requireAlive)
     camera = workspace.CurrentCamera
     if not camera then
         return nil, nil
@@ -3614,17 +3622,20 @@ local function findTarget(screenAnchor, ignoreWallCheck)
 
     for _, player in ipairs(targetPlayerList) do
         if validTarget(player) then
-            local part = getAimPart(player.Character, screenAnchor, ignoreWallCheck)
-            if part and (ignoreWallCheck or not State.WallCheck or partVisible(part)) then
+            local _, humanoid = getTargetCharacterParts(player)
+            if not requireAlive or (humanoid and humanoid.Health > 0) then
+                local part = getAimPart(player.Character, screenAnchor, ignoreWallCheck)
+                if part and (ignoreWallCheck or not State.WallCheck or partVisible(part)) then
                 local point, onScreen = camera:WorldToViewportPoint(part.Position)
                 if onScreen and point.Z > 0 then
                     local dx = point.X - screenAnchor.X
                     local dy = point.Y - screenAnchor.Y
                     local distanceSquared = dx * dx + dy * dy
-                    if distanceSquared < bestDistanceSquared then
-                        bestDistanceSquared = distanceSquared
-                        bestPlayer = player
-                        bestPart = part
+                        if distanceSquared < bestDistanceSquared then
+                            bestDistanceSquared = distanceSquared
+                            bestPlayer = player
+                            bestPart = part
+                        end
                     end
                 end
             end
@@ -3634,9 +3645,66 @@ local function findTarget(screenAnchor, ignoreWallCheck)
     return bestPlayer, bestPart
 end
 
+local function stickyTargetPart(screenAnchor, ignoreWallCheck)
+    local player = stickyTarget
+    if not player then
+        return nil, nil, false
+    end
+
+    if player.Parent ~= Players or player == LocalPlayer or teamIsExcluded(player) then
+        stickyTarget = nil
+        return nil, nil, false
+    end
+
+    local character, humanoid, root = getTargetCharacterParts(player)
+    local deadOrMissing = not character
+        or not humanoid
+        or not root
+        or humanoid.Health <= 0
+
+    if deadOrMissing then
+        if State.StickyMode == "Persist" then
+            return player, nil, true
+        end
+        stickyTarget = nil
+        return nil, nil, false
+    end
+
+    local part = getAimPart(character, screenAnchor, ignoreWallCheck)
+    if not part then
+        if State.StickyMode == "Persist" then
+            return player, nil, true
+        end
+        stickyTarget = nil
+        return nil, nil, false
+    end
+
+    if not ignoreWallCheck and State.WallCheck and not partVisible(part) then
+        return player, nil, true
+    end
+
+    return player, part, true
+end
+
+local function findTarget(screenAnchor, ignoreWallCheck)
+    if not State.StickyAim then
+        return findBestTarget(screenAnchor, ignoreWallCheck)
+    end
+
+    local player, part, retained = stickyTargetPart(screenAnchor, ignoreWallCheck)
+    if retained then
+        return player, part
+    end
+
+    player, part = findBestTarget(screenAnchor, ignoreWallCheck, true)
+    stickyTarget = player
+    return player, part
+end
+
 local function findSilentTarget(screenAnchor)
     local now = os.clock()
-    if TargetRuntime.SilentPlayer
+    if not State.StickyAim
+        and TargetRuntime.SilentPlayer
         and validTarget(TargetRuntime.SilentPlayer)
         and TargetRuntime.SilentPart
         and TargetRuntime.SilentPart.Parent
@@ -3896,6 +3964,17 @@ setTriggerBEnabled = function(enabled)
         if not gun then
             stopTriggerBGun()
             return
+        end
+
+        if triggerBLastGun and triggerBLastGun ~= gun then
+            releaseTriggerInput()
+            if triggerBLastGun.Parent then
+                pcall(function()
+                    triggerBLastGun:Deactivate()
+                end)
+            end
+            triggerBLastGun = nil
+            triggerBLastShot = 0
         end
 
         local ammo = triggerBAmmo(gun)
@@ -4167,21 +4246,21 @@ local compactModePalette = {
     Light = {
         Popup = Color3.fromRGB(243, 244, 247),
         Hover = Color3.fromRGB(233, 236, 241),
-        Stroke = Color3.fromRGB(184, 189, 198),
+        Stroke = Color3.fromRGB(226, 229, 234),
         Text = Color3.fromRGB(79, 84, 93),
         Muted = Color3.fromRGB(132, 138, 148),
     },
     Dark = {
         Popup = Color3.fromRGB(23, 24, 28),
         Hover = Color3.fromRGB(34, 35, 41),
-        Stroke = Color3.fromRGB(78, 81, 91),
+        Stroke = Color3.fromRGB(39, 41, 47),
         Text = Color3.fromRGB(205, 208, 214),
         Muted = Color3.fromRGB(141, 145, 154),
     },
     Black = {
         Popup = Color3.fromRGB(14, 15, 18),
         Hover = Color3.fromRGB(25, 26, 31),
-        Stroke = Color3.fromRGB(68, 71, 81),
+        Stroke = Color3.fromRGB(31, 33, 38),
         Text = Color3.fromRGB(209, 212, 218),
         Muted = Color3.fromRGB(133, 137, 147),
     },
@@ -4220,8 +4299,8 @@ compactModeDots.MouseButton1Click:Connect(function()
 
     local themeName = Consist:GetTheme()
     local palette = compactModePalette[themeName] or compactModePalette.Dark
-    local menuWidth = 92
-    local rowHeight = 17
+    local menuWidth = 108
+    local rowHeight = 20
     local menuHeight = 4 + (#modeBehaviorMenu * rowHeight)
 
     local menu = Instance.new("TextButton")
@@ -4288,7 +4367,7 @@ compactModeDots.MouseButton1Click:Connect(function()
         local marker = Instance.new("Frame")
         marker.AnchorPoint = Vector2.new(0.5, 0.5)
         marker.Position = UDim2.new(0, 10, 0.5, 0)
-        marker.Size = UDim2.fromOffset(2, 2)
+        marker.Size = UDim2.fromOffset(3, 3)
         marker.BackgroundColor3 = selected and palette.Text or palette.Muted
         marker.BorderSizePixel = 0
         marker.ZIndex = 1502
@@ -4306,7 +4385,7 @@ compactModeDots.MouseButton1Click:Connect(function()
         rowLabel.Font = Enum.Font.Gotham
         rowLabel.Text = item.Name
         rowLabel.TextColor3 = palette.Text
-        rowLabel.TextSize = 8
+        rowLabel.TextSize = 10
         rowLabel.TextXAlignment = Enum.TextXAlignment.Left
         rowLabel.ZIndex = 1502
         rowLabel.Parent = row
@@ -4632,6 +4711,202 @@ rememberToggle(WallBSection:Toggle({
         setFastShootEnabled(value)
     end,
 }))
+
+do
+local stickyAimMenu = {
+    {
+        Name = "Retarget",
+        Selected = function()
+            return State.StickyMode == "Retarget"
+        end,
+        Action = function()
+            State.StickyMode = "Retarget"
+            clearTargets()
+        end,
+    },
+    {
+        Name = "Persist",
+        Selected = function()
+            return State.StickyMode == "Persist"
+        end,
+        Action = function()
+            State.StickyMode = "Persist"
+            clearTargets()
+        end,
+    },
+}
+
+local stickyControl = WallBSection:Toggle({
+    Name = "Sticky Aim",
+    Default = false,
+    Menu = stickyAimMenu,
+    Callback = function(value)
+        State.StickyAim = value == true
+        clearTargets()
+    end,
+})
+rememberToggle(stickyControl)
+
+local stickyDots
+local stickyMenu
+local stickyRow = stickyControl.Instance.Parent
+for _, child in ipairs(stickyRow:GetChildren()) do
+    if child:IsA("TextButton") and child.Text ~= "" then
+        stickyDots = child:Clone()
+        stickyDots.Text = "..."
+        stickyDots.Position = UDim2.fromOffset(198, 4)
+        stickyDots.Size = UDim2.fromOffset(30, 24)
+        stickyDots.TextSize = 12
+        stickyDots.TextXAlignment = Enum.TextXAlignment.Center
+        stickyDots.TextYAlignment = Enum.TextYAlignment.Center
+        stickyDots.Parent = stickyRow
+        child:Destroy()
+        break
+    end
+end
+
+if stickyDots then
+    local function closeStickyMenu()
+        if stickyMenu then
+            stickyMenu:Destroy()
+            stickyMenu = nil
+        end
+    end
+
+    stickyDots.MouseButton1Click:Connect(function()
+        if stickyMenu then
+            closeStickyMenu()
+            return
+        end
+
+        local themeName = Consist:GetTheme()
+        local palette = compactModePalette[themeName] or compactModePalette.Dark
+        local menuWidth = 108
+        local rowHeight = 20
+        local menuHeight = 4 + (#stickyAimMenu * rowHeight)
+        local menu = Instance.new("TextButton")
+        menu.Name = "StickyAimMenu"
+        menu.Size = UDim2.fromOffset(menuWidth, 0)
+        menu.BackgroundColor3 = palette.Popup
+        menu.BorderSizePixel = 0
+        menu.Text = ""
+        menu.AutoButtonColor = false
+        menu.Active = true
+        menu.ClipsDescendants = true
+        menu.ZIndex = 1500
+        local popupLayer = Consist.Gui:FindFirstChild("Overlay") or Consist.Gui
+        menu.Parent = popupLayer
+
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 6)
+        corner.Parent = menu
+
+        local stroke = Instance.new("UIStroke")
+        stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        stroke.Color = palette.Stroke
+        stroke.Thickness = 1
+        stroke.Transparency = 0
+        stroke.Parent = menu
+
+        local anchorPosition = stickyDots.AbsolutePosition
+        local layerPosition = popupLayer.AbsolutePosition
+        local appPosition = Consist.App.AbsolutePosition
+        local appSize = Consist.App.AbsoluteSize
+        local appLeft = appPosition.X - layerPosition.X
+        local appTop = appPosition.Y - layerPosition.Y
+        local targetX = anchorPosition.X - layerPosition.X - menuWidth - 3
+        local targetY = anchorPosition.Y - layerPosition.Y
+        targetX = math.clamp(targetX, appLeft + 4, appLeft + appSize.X - menuWidth - 4)
+        targetY = math.clamp(targetY, appTop + 4, appTop + appSize.Y - menuHeight - 4)
+        menu.Position = UDim2.fromOffset(math.floor(targetX), math.floor(targetY))
+
+        for index, item in ipairs(stickyAimMenu) do
+            local selected = item.Selected()
+            local row = Instance.new("TextButton")
+            row.Position = UDim2.fromOffset(2, 2 + (index - 1) * rowHeight)
+            row.Size = UDim2.new(1, -4, 0, rowHeight)
+            row.BackgroundColor3 = palette.Hover
+            row.BackgroundTransparency = selected and 0 or 1
+            row.BorderSizePixel = 0
+            row.Text = ""
+            row.AutoButtonColor = false
+            row.ZIndex = 1501
+            row.Parent = menu
+
+            local rowCorner = Instance.new("UICorner")
+            rowCorner.CornerRadius = UDim.new(0, 3)
+            rowCorner.Parent = row
+
+            local marker = Instance.new("Frame")
+            marker.AnchorPoint = Vector2.new(0.5, 0.5)
+            marker.Position = UDim2.new(0, 10, 0.5, 0)
+            marker.Size = UDim2.fromOffset(3, 3)
+            marker.BackgroundColor3 = selected and palette.Text or palette.Muted
+            marker.BorderSizePixel = 0
+            marker.ZIndex = 1502
+            marker.Parent = row
+
+            local markerCorner = Instance.new("UICorner")
+            markerCorner.CornerRadius = UDim.new(1, 0)
+            markerCorner.Parent = marker
+
+            local label = Instance.new("TextLabel")
+            label.Position = UDim2.fromOffset(18, 0)
+            label.Size = UDim2.new(1, -22, 1, 0)
+            label.BackgroundTransparency = 1
+            label.BorderSizePixel = 0
+            label.Font = Enum.Font.Gotham
+            label.Text = item.Name
+            label.TextColor3 = palette.Text
+            label.TextSize = 10
+            label.TextXAlignment = Enum.TextXAlignment.Left
+            label.ZIndex = 1502
+            label.Parent = row
+
+            row.MouseEnter:Connect(function()
+                row.BackgroundTransparency = 0
+            end)
+            row.MouseLeave:Connect(function()
+                row.BackgroundTransparency = selected and 0 or 1
+            end)
+            row.MouseButton1Click:Connect(function()
+                item.Action()
+                closeStickyMenu()
+            end)
+        end
+
+        stickyMenu = menu
+        TweenService:Create(
+            menu,
+            TweenInfo.new(0.10, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+            {Size = UDim2.fromOffset(menuWidth, menuHeight)}
+        ):Play()
+    end)
+
+    connect(UserInputService.InputBegan, function(input)
+        if not stickyMenu
+            or (input.UserInputType ~= Enum.UserInputType.MouseButton1
+                and input.UserInputType ~= Enum.UserInputType.Touch) then
+            return
+        end
+
+        local point = input.Position
+        local function contains(object)
+            local position = object.AbsolutePosition
+            local size = object.AbsoluteSize
+            return point.X >= position.X
+                and point.Y >= position.Y
+                and point.X <= position.X + size.X
+                and point.Y <= position.Y + size.Y
+        end
+
+        if contains(stickyMenu) or contains(stickyDots) then
+            return
+        end
+        closeStickyMenu()
+    end)
+end
+end
 
 local TriggerBotSection = makeTitledSection(Combat, "Right", "Trigger Bot")
 rememberToggle(TriggerBotSection:Toggle({
@@ -4963,20 +5238,11 @@ connect(RunService.RenderStepped, function()
     end
 
     if camActive then
-        if not validTarget(camTarget) then
-            camTarget = nil
-        end
-
         local part
-        if camTarget then
-            part = getAimPart(camTarget.Character, screenCenter)
-            if State.WallCheck and not partVisible(part) then
-                camTarget = nil
-                part = nil
-            end
-        end
-        if not camTarget then
+        if State.StickyAim then
             camTarget, part = findTarget(screenCenter)
+        else
+            camTarget, part = findBestTarget(screenCenter, false)
         end
 
         local predicted = predictedPosition(part)
@@ -4991,20 +5257,11 @@ connect(RunService.RenderStepped, function()
     end
 
     if mouseActive then
-        if not validTarget(mouseTarget) then
-            mouseTarget = nil
-        end
-
         local part
-        if mouseTarget then
-            part = getAimPart(mouseTarget.Character, mousePosition)
-            if State.WallCheck and not partVisible(part) then
-                mouseTarget = nil
-                part = nil
-            end
-        end
-        if not mouseTarget then
+        if State.StickyAim then
             mouseTarget, part = findTarget(mousePosition)
+        else
+            mouseTarget, part = findBestTarget(mousePosition, false)
         end
 
         local predicted = predictedPosition(part)
@@ -7220,13 +7477,6 @@ VisualMain:Dropdown({
 })
 ESP.UpdateHz = State.VisualHz
 rememberToggle(VisualMain:Toggle({
-    Name = "Team",
-    Default = false,
-    Callback = function(value)
-        ESP.TeamIndicatorEnabled = value
-    end,
-}))
-rememberToggle(VisualMain:Toggle({
     Name = "Distance",
     Default = false,
     Callback = function(value)
@@ -7252,6 +7502,13 @@ VisualTracers:Dropdown({
 })
 
 local VisualIndicators = makeTitledSection(Visual, "Left", "Indicators")
+rememberToggle(VisualIndicators:Toggle({
+    Name = "Team",
+    Default = false,
+    Callback = function(value)
+        ESP.TeamIndicatorEnabled = value
+    end,
+}))
 rememberToggle(VisualIndicators:Toggle({
     Name = "Item",
     Default = false,
