@@ -60,8 +60,30 @@ local DefaultModeBinds = {
     Silent = Enum.KeyCode.Unknown,
 }
 
+-- Roblox reserves the number row for Backpack/hotbar selection. Keep Consist
+-- feature binds off these keys so a Spinbot/aim/movement bind can never fight
+-- the game's own 1-0 weapon-slot handling.
+local HotbarNumberKeys = {
+    [Enum.KeyCode.One] = true,
+    [Enum.KeyCode.Two] = true,
+    [Enum.KeyCode.Three] = true,
+    [Enum.KeyCode.Four] = true,
+    [Enum.KeyCode.Five] = true,
+    [Enum.KeyCode.Six] = true,
+    [Enum.KeyCode.Seven] = true,
+    [Enum.KeyCode.Eight] = true,
+    [Enum.KeyCode.Nine] = true,
+    [Enum.KeyCode.Zero] = true,
+}
+
+local function isHotbarNumberInput(input)
+    return input
+        and input.UserInputType == Enum.UserInputType.Keyboard
+        and HotbarNumberKeys[input.KeyCode] == true
+end
+
 local State = {
-    SelectedMode = "Camlock",
+    SelectedMode = "Silent",
     ModeEnabled = {
         Camlock = false,
         Mouselock = false,
@@ -77,18 +99,18 @@ local State = {
         Mouselock = "Toggle",
         Silent = "Toggle",
     },
-    Prediction = 0.035,
+    Prediction = 0.005,
     Smoothness = 2.5,
     FovEnabled = false,
     FovAimOnly = false,
     FovRadius = 150,
-    AimPart = "HumanoidRootPart",
+    AimPart = "UpperTorso",
     AdaptiveAim = false,
-    AdaptiveStrength = 35,
     WallB = false,
     AutoSwap = false,
     AutoReload = false,
     TriggerB = false,
+    TargetUI = false,
     StickyAim = false,
     StickyMode = "Retarget",
     SemiAutomatic = false,
@@ -97,7 +119,9 @@ local State = {
     FastShoot = false,
     WallCheck = false,
     DeadCheck = true,
-    TeamCheck = false,
+    Forcefield = true,
+    FriendCheck = false,
+    TeamCheck = true,
     ExcludedTeams = {},
     Noclip = false,
     AntiSeat = false,
@@ -154,6 +178,7 @@ local wallBSetEnabled
 local fastShootCleanup
 local autoReloadCleanup
 local triggerBCleanup
+local targetUiCleanup
 local semiAutomaticCleanup
 local PlayerFeatures = {}
 local MovementFeatures = {}
@@ -233,6 +258,9 @@ end
 local function bindingFromInput(input)
     if input.UserInputType == Enum.UserInputType.Keyboard
         and input.KeyCode ~= Enum.KeyCode.Unknown then
+        if HotbarNumberKeys[input.KeyCode] then
+            return nil
+        end
         return input.KeyCode
     end
     if input.UserInputType == Enum.UserInputType.MouseButton1
@@ -244,6 +272,9 @@ local function bindingFromInput(input)
 end
 
 local function inputMatches(input, binding)
+    if isHotbarNumberInput(input) then
+        return false
+    end
     if typeof(binding) ~= "EnumItem" then
         return false
     end
@@ -808,6 +839,9 @@ local autoSwapPriorities = {
 local autoSwapLastRun = 0
 local autoSwapConnections = {}
 local autoSwapGunConnections = {}
+local autoSwapTrackedGun
+local autoSwapLastAmmo
+local autoSwapManualEquipGraceUntil = 0
 
 local function disconnectAutoSwapList(list)
     for _, connection in ipairs(list) do
@@ -816,6 +850,17 @@ local function disconnectAutoSwapList(list)
         end)
     end
     table.clear(list)
+end
+
+local function readAutoSwapAmmo(tool)
+    if not tool then
+        return nil
+    end
+    local ammo = tool:GetAttribute("Local_CurrentAmmo")
+    if type(ammo) ~= "number" then
+        ammo = tool:GetAttribute("CurrentAmmo")
+    end
+    return type(ammo) == "number" and ammo or nil
 end
 
 local function getAutoSwapWeapon()
@@ -845,6 +890,14 @@ local function tryAutoSwap(tool)
     if not runtimeAlive or not State.AutoSwap then
         return
     end
+
+    -- A number-row press is an explicit manual weapon selection. Never let
+    -- Auto Swap immediately override that selection while the new Tool's ammo
+    -- attributes are still settling.
+    if os.clock() < autoSwapManualEquipGraceUntil then
+        return
+    end
+
     local character = LocalPlayer.Character
     local humanoid = character and character:FindFirstChildOfClass("Humanoid")
     local equipped = character and character:FindFirstChildOfClass("Tool")
@@ -852,43 +905,66 @@ local function tryAutoSwap(tool)
         return
     end
 
-    local ammo = equipped:GetAttribute("Local_CurrentAmmo")
-    if ammo == nil then
-        ammo = equipped:GetAttribute("CurrentAmmo")
-    end
+    local ammo = readAutoSwapAmmo(equipped)
     if type(ammo) ~= "number" or ammo > 0 or os.clock() - autoSwapLastRun < 0.15 then
         return
     end
 
-    local replacement = getAutoSwapWeapon()
-    if replacement then
+    local replacementTool = getAutoSwapWeapon()
+    if replacementTool then
         autoSwapLastRun = os.clock()
         pcall(function()
-            humanoid:EquipTool(replacement)
+            humanoid:EquipTool(replacementTool)
         end)
+    end
+end
+
+local function onAutoSwapAmmoChanged(tool)
+    if tool ~= autoSwapTrackedGun then
+        return
+    end
+
+    local ammo = readAutoSwapAmmo(tool)
+    local previous = autoSwapLastAmmo
+    autoSwapLastAmmo = ammo
+
+    -- Only treat an actual depletion as an Auto Swap request. This prevents
+    -- selecting slot 2/3/4 from bouncing back to the highest-priority gun when
+    -- a freshly equipped Tool briefly reports zero/stale ammo.
+    if type(previous) == "number"
+        and previous > 0
+        and type(ammo) == "number"
+        and ammo <= 0 then
+        task.defer(tryAutoSwap, tool)
     end
 end
 
 local function bindAutoSwapGun(tool)
     disconnectAutoSwapList(autoSwapGunConnections)
+    autoSwapTrackedGun = nil
+    autoSwapLastAmmo = nil
+
     if not State.AutoSwap or not tool or not tool:IsA("Tool") then
         return
     end
 
+    autoSwapTrackedGun = tool
+    autoSwapLastAmmo = readAutoSwapAmmo(tool)
+
     for _, attribute in ipairs({"Local_CurrentAmmo", "CurrentAmmo"}) do
         autoSwapGunConnections[#autoSwapGunConnections + 1] =
             tool:GetAttributeChangedSignal(attribute):Connect(function()
-                tryAutoSwap(tool)
+                onAutoSwapAmmoChanged(tool)
             end)
     end
-    task.defer(function()
-        tryAutoSwap(tool)
-    end)
 end
 
 local function bindAutoSwapCharacter(character)
     disconnectAutoSwapList(autoSwapConnections)
     disconnectAutoSwapList(autoSwapGunConnections)
+    autoSwapTrackedGun = nil
+    autoSwapLastAmmo = nil
+
     if not State.AutoSwap then
         return
     end
@@ -919,6 +995,7 @@ local function bindAutoSwapCharacter(character)
             end)
         end
     end)
+
     bindAutoSwapGun(character:FindFirstChildOfClass("Tool"))
 end
 
@@ -926,10 +1003,19 @@ local function setAutoSwapEnabled(enabled)
     State.AutoSwap = enabled == true
     disconnectAutoSwapList(autoSwapConnections)
     disconnectAutoSwapList(autoSwapGunConnections)
+    autoSwapTrackedGun = nil
+    autoSwapLastAmmo = nil
     if State.AutoSwap then
         bindAutoSwapCharacter(LocalPlayer.Character)
     end
 end
+
+-- Give explicit Roblox hotbar selections priority over Auto Swap.
+connect(UserInputService.InputBegan, function(input)
+    if isHotbarNumberInput(input) then
+        autoSwapManualEquipGraceUntil = os.clock() + 0.35
+    end
+end)
 
 local PhysicsService = game:GetService("PhysicsService")
 local noclipConnection
@@ -3399,6 +3485,9 @@ local function clearTargets()
     end
 end
 
+local friendStatusCache = setmetatable({}, {__mode = "k"})
+local friendStatusPending = setmetatable({}, {__mode = "k"})
+
 local function teamIsExcluded(player)
     if not player then
         return false
@@ -3408,6 +3497,74 @@ local function teamIsExcluded(player)
         return State.ExcludedTeams[team.Name] == true
     end
     return player.Neutral == true and State.ExcludedTeams.Neutral == true
+end
+
+local function queueFriendStatus(player)
+    if not player
+        or player == LocalPlayer
+        or friendStatusCache[player] ~= nil
+        or friendStatusPending[player] then
+        return
+    end
+
+    friendStatusPending[player] = true
+    task.spawn(function()
+        local isFriend = false
+        local ok, result = pcall(function()
+            return LocalPlayer:IsFriendsWith(player.UserId)
+        end)
+
+        if ok then
+            isFriend = result == true
+        else
+            local statusOk, status = pcall(function()
+                return LocalPlayer:GetFriendStatus(player)
+            end)
+            if statusOk then
+                isFriend = status == Enum.FriendStatus.Friend
+            end
+        end
+
+        friendStatusPending[player] = nil
+        if player.Parent == Players then
+            friendStatusCache[player] = isFriend
+            if State.FriendCheck then
+                clearTargets()
+                if wallBRefreshTeams then
+                    wallBRefreshTeams()
+                end
+            end
+        end
+    end)
+end
+
+local function friendIsExcluded(player)
+    if not State.FriendCheck or not player or player == LocalPlayer then
+        return false
+    end
+
+    local cached = friendStatusCache[player]
+    if cached == nil then
+        queueFriendStatus(player)
+        -- Keep an unresolved player out of targeting until Roblox returns their
+        -- friendship status so Friend Check cannot briefly target a real friend.
+        return true
+    end
+    return cached == true
+end
+
+local function targetIsExcluded(player)
+    if teamIsExcluded(player) then
+        return true
+    end
+
+    -- Friend filtering is completely dormant unless Friend Check is enabled.
+    -- Cached friendship data by itself must never make a player invalid.
+    if State.FriendCheck then
+        return friendIsExcluded(player)
+    end
+
+    return false
 end
 
 TargetRuntime = {
@@ -3467,7 +3624,13 @@ local function validTarget(player)
     if not humanoid or not root or (State.DeadCheck and humanoid.Health <= 0) then
         return false
     end
-    return not teamIsExcluded(player)
+    return not targetIsExcluded(player)
+end
+
+local function hasTargetForceField(player)
+    local character = player and player.Character
+    return character ~= nil
+        and character:FindFirstChildWhichIsA("ForceField", true) ~= nil
 end
 
 local function partVisible(part)
@@ -3544,44 +3707,41 @@ local function getAimPart(character, screenAnchor, ignoreWallCheck)
     if not State.AdaptiveAim then
         return resolveAimPart(character, State.AimPart)
     end
+
     camera = workspace.CurrentCamera
     if not camera then
         return resolveAimPart(character, State.AimPart)
     end
 
-    local bestPart
-    local bestScore = math.huge
-    local currentPart = adaptivePartCache[character]
-    local currentScore = math.huge
+    -- Adaptive Aim always keeps a usable target part, but gives priority to
+    -- body parts that are actually visible whenever one is available.
+    local bestVisiblePart
+    local bestVisibleScore = math.huge
+    local bestFallbackPart
+    local bestFallbackScore = math.huge
 
     for _, part in ipairs(getAdaptiveCandidates(character)) do
         local point, onScreen = camera:WorldToViewportPoint(part.Position)
         if onScreen and point.Z > 0 then
             local dx = point.X - screenAnchor.X
             local dy = point.Y - screenAnchor.Y
-            local score = math.sqrt(dx * dx + dy * dy)
-            if State.WallCheck and not ignoreWallCheck and not partVisible(part) then
-                score += 100000
+            local score = dx * dx + dy * dy
+
+            if score < bestFallbackScore then
+                bestFallbackScore = score
+                bestFallbackPart = part
             end
-            if score < bestScore then
-                bestScore = score
-                bestPart = part
-            end
-            if part == currentPart then
-                currentScore = score
+
+            if partVisible(part) and score < bestVisibleScore then
+                bestVisibleScore = score
+                bestVisiblePart = part
             end
         end
     end
 
-    local switchResistance = math.clamp(State.AdaptiveStrength, 0, 100) * 0.9
-    if currentPart
-        and currentPart.Parent == character
-        and currentScore < math.huge
-        and bestScore + switchResistance >= currentScore then
-        return currentPart
-    end
-
-    local selected = bestPart or resolveAimPart(character, State.AimPart)
+    local selected = bestVisiblePart
+        or bestFallbackPart
+        or resolveAimPart(character, State.AimPart)
     adaptivePartCache[character] = selected
     return selected
 end
@@ -3590,12 +3750,18 @@ local targetPlayerList = {}
 for _, player in ipairs(Players:GetPlayers()) do
     if player ~= LocalPlayer then
         targetPlayerList[#targetPlayerList + 1] = player
+        if State.FriendCheck then
+            queueFriendStatus(player)
+        end
     end
 end
 
 connect(Players.PlayerAdded, function(player)
     if player ~= LocalPlayer then
         targetPlayerList[#targetPlayerList + 1] = player
+        if State.FriendCheck then
+            queueFriendStatus(player)
+        end
     end
 end)
 
@@ -3604,10 +3770,27 @@ connect(Players.PlayerRemoving, function(player)
     if index then
         table.remove(targetPlayerList, index)
     end
+    friendStatusCache[player] = nil
+    friendStatusPending[player] = nil
     if stickyTarget == player then
         stickyTarget = nil
         TargetRuntime:ClearSilent()
     end
+end)
+
+pcall(function()
+    connect(LocalPlayer.FriendStatusChanged, function(player, status)
+        if player and player ~= LocalPlayer then
+            friendStatusPending[player] = nil
+            friendStatusCache[player] = status == Enum.FriendStatus.Friend
+            if State.FriendCheck then
+                clearTargets()
+                if wallBRefreshTeams then
+                    wallBRefreshTeams()
+                end
+            end
+        end
+    end)
 end)
 
 local function findBestTarget(screenAnchor, ignoreWallCheck, requireAlive)
@@ -3651,7 +3834,7 @@ local function stickyTargetPart(screenAnchor, ignoreWallCheck)
         return nil, nil, false
     end
 
-    if player.Parent ~= Players or player == LocalPlayer or teamIsExcluded(player) then
+    if player.Parent ~= Players or player == LocalPlayer or targetIsExcluded(player) then
         stickyTarget = nil
         return nil, nil, false
     end
@@ -3715,6 +3898,7 @@ local function findSilentTarget(screenAnchor)
     end
 
     local player, part = findTarget(screenAnchor, false)
+
     TargetRuntime.SilentPlayer = player
     TargetRuntime.SilentPart = part
     TargetRuntime.SilentAt = now
@@ -3773,6 +3957,16 @@ local function triggerBTarget()
         return nil, nil
     end
 
+    local function allowTarget(player, part)
+        if not player or not part then
+            return nil, nil
+        end
+        if State.Forcefield and hasTargetForceField(player) then
+            return nil, nil
+        end
+        return player, part
+    end
+
     camera = workspace.CurrentCamera
     if not camera then
         return nil, nil
@@ -3787,9 +3981,9 @@ local function triggerBTarget()
         local target = validTarget(camTarget) and camTarget or nil
         local part = target and getAimPart(target.Character, camera.ViewportSize / 2) or nil
         if target and part and (not State.WallCheck or partVisible(part)) then
-            return target, part
+            return allowTarget(target, part)
         end
-        return findTarget(camera.ViewportSize / 2, false)
+        return allowTarget(findTarget(camera.ViewportSize / 2, false))
     end
 
     local mousePosition = UserInputService:GetMouseLocation()
@@ -3797,13 +3991,13 @@ local function triggerBTarget()
         local target = validTarget(mouseTarget) and mouseTarget or nil
         local part = target and getAimPart(target.Character, mousePosition) or nil
         if target and part and (not State.WallCheck or partVisible(part)) then
-            return target, part
+            return allowTarget(target, part)
         end
-        return findTarget(mousePosition, false)
+        return allowTarget(findTarget(mousePosition, false))
     end
 
     if selected == "Silent" then
-        return findSilentTarget(mousePosition)
+        return allowTarget(findSilentTarget(mousePosition))
     end
 
     return nil, nil
@@ -4024,6 +4218,13 @@ setTriggerBEnabled = function(enabled)
     end)
 end
 
+connect(UserInputService.InputBegan, function(input)
+    if State.TriggerB and isHotbarNumberInput(input) then
+        stopTriggerBGun()
+        triggerBLastShot = 0
+    end
+end)
+
 triggerBCleanup = function()
     setTriggerBEnabled(false)
 end
@@ -4141,6 +4342,47 @@ local function makeTitledSection(page, side, title)
     return section
 end
 
+-- Compact a dropdown that intentionally has no row label.  Do this on the
+-- actual generated GUI objects instead of patching the remote library source,
+-- so it remains reliable when the library changes formatting internally.
+local function compactSectionDropdown(section, control)
+    local holder = control and control.Instance
+    if not holder then
+        return
+    end
+
+    local title
+    local field
+    for _, child in ipairs(holder:GetChildren()) do
+        if child:IsA("TextLabel") then
+            title = child
+        elseif child:IsA("TextButton") then
+            field = child
+        end
+    end
+
+    if title then
+        title.Visible = false
+    end
+    local compactTopPadding = 4
+    if field then
+        field.Position = UDim2.fromOffset(8, compactTopPadding)
+    end
+
+    local oldHeight = holder.Size.Y.Offset
+    -- Match the normal dropdown spacing: 4 px above the field and
+    -- 3 px of breathing room below it before the next divider/row.
+    local compactHeight = 31
+    holder.Size = UDim2.new(1, 0, 0, compactHeight)
+
+    local reclaimed = math.max(0, oldHeight - compactHeight)
+    if reclaimed > 0 then
+        section.ContentHeight = math.max(26, section.ContentHeight - reclaimed)
+        section.Frame.Size = UDim2.fromOffset(258, section.ContentHeight)
+        section.Shadow.Size = UDim2.fromOffset(258, section.ContentHeight)
+    end
+end
+
 local lastSectionTitleTheme = Consist:GetTheme()
 task.spawn(function()
     while runtimeAlive do
@@ -4171,8 +4413,8 @@ end)
 do
 local ModeSection = makeTitledSection(Combat, "Left", "Aim Type")
 local setCombatModeLayout
-ModeSection:Dropdown({
-    Name = "Combat Type",
+local modeTypeDropdown = ModeSection:Dropdown({
+    Name = "",
     Options = {"Camlock", "Mouselock", "Silent"},
     Default = State.SelectedMode,
     Callback = function(selected)
@@ -4193,6 +4435,7 @@ ModeSection:Dropdown({
         end
     end,
 })
+compactSectionDropdown(ModeSection, modeTypeDropdown)
 
 local modeBehaviorMenu = {
         {
@@ -4437,7 +4680,7 @@ end)
 
 local libraryKeybind = ModeSection:Keybind({
     Name = "Keybind",
-    Default = State.ModeBinds.Camlock,
+    Default = State.ModeBinds[State.SelectedMode],
     ResetValue = function()
         return DefaultModeBinds[State.SelectedMode]
     end,
@@ -4456,7 +4699,7 @@ local libraryKeybind = ModeSection:Keybind({
 
 modeKeybindDisplay = installExternalKeybind(
     libraryKeybind,
-    State.ModeBinds.Camlock,
+    State.ModeBinds[State.SelectedMode],
     function(value)
         local selectedMode = State.SelectedMode
         State.ModeBinds[selectedMode] = value
@@ -4550,59 +4793,374 @@ do
     )
 end
 
+local TargetUISection = makeTitledSection(Combat, "Left", "Target UI")
+rememberToggle(TargetUISection:Toggle({
+    Name = "Toggle",
+    Default = false,
+    Callback = function(value)
+        State.TargetUI = value == true
+    end,
+}))
+
+do
+    local targetPanel = Instance.new("Frame")
+    targetPanel.Name = "ConsistTargetUI"
+    targetPanel.AnchorPoint = Vector2.new(0, 1)
+    targetPanel.Position = UDim2.new(0, 12, 1, -12)
+    targetPanel.Size = UDim2.fromOffset(208, 52)
+    targetPanel.BackgroundTransparency = 0.08
+    targetPanel.BorderSizePixel = 0
+    targetPanel.Visible = false
+    targetPanel.ZIndex = 1200
+    targetPanel.Parent = priorityOverlayGui
+
+    local panelCorner = Instance.new("UICorner")
+    panelCorner.CornerRadius = UDim.new(0, 7)
+    panelCorner.Parent = targetPanel
+
+    local panelStroke = Instance.new("UIStroke")
+    panelStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    panelStroke.Thickness = 1.35
+    panelStroke.Transparency = 0
+    panelStroke.Parent = targetPanel
+
+    local avatar = Instance.new("ImageLabel")
+    avatar.Name = "Avatar"
+    avatar.Position = UDim2.fromOffset(7, 7)
+    avatar.Size = UDim2.fromOffset(38, 38)
+    avatar.BackgroundTransparency = 1
+    avatar.BorderSizePixel = 0
+    avatar.ZIndex = 1201
+    avatar.Parent = targetPanel
+
+    local avatarCorner = Instance.new("UICorner")
+    avatarCorner.CornerRadius = UDim.new(0, 5)
+    avatarCorner.Parent = avatar
+
+    local avatarStroke = Instance.new("UIStroke")
+    avatarStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    avatarStroke.Thickness = 1.25
+    avatarStroke.Transparency = 0.22
+    avatarStroke.Parent = avatar
+
+    local displayLabel = Instance.new("TextLabel")
+    displayLabel.Name = "DisplayName"
+    displayLabel.Position = UDim2.fromOffset(54, 4)
+    displayLabel.Size = UDim2.fromOffset(146, 16)
+    displayLabel.BackgroundTransparency = 1
+    displayLabel.BorderSizePixel = 0
+    displayLabel.Font = Enum.Font.GothamMedium
+    displayLabel.Text = ""
+    displayLabel.TextSize = 11
+    displayLabel.TextXAlignment = Enum.TextXAlignment.Left
+    displayLabel.TextYAlignment = Enum.TextYAlignment.Center
+    displayLabel.TextTruncate = Enum.TextTruncate.AtEnd
+    displayLabel.ZIndex = 1201
+    displayLabel.Parent = targetPanel
+
+    local usernameLabel = Instance.new("TextLabel")
+    usernameLabel.Name = "Username"
+    usernameLabel.Position = UDim2.fromOffset(54, 18)
+    usernameLabel.Size = UDim2.fromOffset(146, 14)
+    usernameLabel.BackgroundTransparency = 1
+    usernameLabel.BorderSizePixel = 0
+    usernameLabel.Font = Enum.Font.Gotham
+    usernameLabel.Text = ""
+    usernameLabel.TextSize = 10
+    usernameLabel.TextXAlignment = Enum.TextXAlignment.Left
+    usernameLabel.TextYAlignment = Enum.TextYAlignment.Center
+    usernameLabel.TextTruncate = Enum.TextTruncate.AtEnd
+    usernameLabel.ZIndex = 1201
+    usernameLabel.Parent = targetPanel
+
+    local healthBack = Instance.new("Frame")
+    healthBack.Name = "HealthBack"
+    healthBack.Position = UDim2.fromOffset(54, 38)
+    healthBack.Size = UDim2.fromOffset(111, 5)
+    healthBack.BorderSizePixel = 0
+    healthBack.ZIndex = 1201
+    healthBack.Parent = targetPanel
+
+    local healthBackCorner = Instance.new("UICorner")
+    healthBackCorner.CornerRadius = UDim.new(1, 0)
+    healthBackCorner.Parent = healthBack
+
+    local healthStroke = Instance.new("UIStroke")
+    healthStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    healthStroke.Thickness = 1.1
+    healthStroke.Transparency = 0.08
+    healthStroke.Parent = healthBack
+
+    local healthFill = Instance.new("Frame")
+    healthFill.Name = "HealthFill"
+    healthFill.Size = UDim2.fromScale(1, 1)
+    healthFill.BorderSizePixel = 0
+    healthFill.ZIndex = 1202
+    healthFill.Parent = healthBack
+
+    local healthFillCorner = Instance.new("UICorner")
+    healthFillCorner.CornerRadius = UDim.new(1, 0)
+    healthFillCorner.Parent = healthFill
+
+    local healthText = Instance.new("TextLabel")
+    healthText.Name = "HealthText"
+    healthText.Position = UDim2.fromOffset(171, 31)
+    healthText.Size = UDim2.fromOffset(29, 18)
+    healthText.BackgroundTransparency = 1
+    healthText.BorderSizePixel = 0
+    healthText.Font = Enum.Font.GothamMedium
+    healthText.Text = ""
+    healthText.TextSize = 10
+    healthText.TextXAlignment = Enum.TextXAlignment.Right
+    healthText.TextYAlignment = Enum.TextYAlignment.Center
+    healthText.ZIndex = 1201
+    healthText.Parent = targetPanel
+
+    local palettes = {
+        Light = {
+            Background = Color3.fromRGB(247, 248, 250),
+            Stroke = Color3.fromRGB(226, 229, 234),
+            Text = Color3.fromRGB(42, 46, 54),
+            Muted = Color3.fromRGB(102, 108, 119),
+            HealthBack = Color3.fromRGB(220, 223, 229),
+        },
+        Dark = {
+            Background = Color3.fromRGB(20, 21, 25),
+            Stroke = Color3.fromRGB(39, 41, 47),
+            Text = Color3.fromRGB(228, 230, 234),
+            Muted = Color3.fromRGB(165, 169, 178),
+            HealthBack = Color3.fromRGB(38, 40, 46),
+        },
+        Black = {
+            Background = Color3.fromRGB(12, 13, 16),
+            Stroke = Color3.fromRGB(31, 33, 38),
+            Text = Color3.fromRGB(232, 234, 238),
+            Muted = Color3.fromRGB(160, 164, 173),
+            HealthBack = Color3.fromRGB(29, 31, 36),
+        },
+    }
+
+    local lastTarget
+    local lastTheme
+    local accumulator = 0
+
+    local function applyTheme()
+        local themeName = Consist:GetTheme()
+        if themeName == lastTheme then
+            return
+        end
+        lastTheme = themeName
+        local palette = palettes[themeName] or palettes.Dark
+        targetPanel.BackgroundColor3 = palette.Background
+        panelStroke.Color = palette.Stroke
+        avatarStroke.Color = palette.Stroke
+        displayLabel.TextColor3 = palette.Text
+        usernameLabel.TextColor3 = palette.Muted
+        healthText.TextColor3 = palette.Text
+        healthBack.BackgroundColor3 = palette.HealthBack
+        healthStroke.Color = palette.Stroke
+    end
+
+    local function playerIsUnderCurrentAim(player, modeName)
+        if not player or not validTarget(player) then
+            return false
+        end
+
+        camera = workspace.CurrentCamera
+        local character = player.Character
+        if not camera or not character then
+            return false
+        end
+
+        local anchor
+        if modeName == "Camlock" then
+            anchor = camera.ViewportSize / 2
+        else
+            anchor = UserInputService:GetMouseLocation()
+        end
+
+        local part = getAimPart(character, anchor, false)
+        if not part then
+            return false
+        end
+        if State.WallCheck and not partVisible(part) then
+            return false
+        end
+
+        local point, onScreen = camera:WorldToViewportPoint(part.Position)
+        if not onScreen or point.Z <= 0 then
+            return false
+        end
+
+        local dx = point.X - anchor.X
+        local dy = point.Y - anchor.Y
+        return (dx * dx + dy * dy) < (State.FovRadius * State.FovRadius)
+    end
+
+    local function currentTarget()
+        if not State.TargetUI or not isModeActive(State.SelectedMode) then
+            return nil
+        end
+
+        local modeName = State.SelectedMode
+        local player
+
+        if modeName == "Camlock" then
+            player = camTarget
+        elseif modeName == "Mouselock" then
+            player = mouseTarget
+        elseif modeName == "Silent" then
+            camera = workspace.CurrentCamera
+            if camera then
+                local silentPlayer, silentPart = findSilentTarget(UserInputService:GetMouseLocation())
+                if silentPart then
+                    player = silentPlayer
+                end
+            end
+        end
+
+        if player and playerIsUnderCurrentAim(player, modeName) then
+            return player
+        end
+        return nil
+    end
+
+    local targetConnection = RunService.RenderStepped:Connect(function(dt)
+        if not runtimeAlive then
+            return
+        end
+
+        accumulator += dt
+        if accumulator < (1 / 60) then
+            return
+        end
+        accumulator = 0
+
+        if not State.TargetUI then
+            targetPanel.Visible = false
+            lastTarget = nil
+            return
+        end
+
+        applyTheme()
+
+        local player = currentTarget()
+        if not player then
+            targetPanel.Visible = false
+            lastTarget = nil
+            return
+        end
+
+        if player ~= lastTarget then
+            lastTarget = player
+            avatar.Image = string.format(
+                "rbxthumb://type=AvatarHeadShot&id=%d&w=150&h=150",
+                player.UserId
+            )
+            displayLabel.Text = player.DisplayName
+            usernameLabel.Text = "@" .. player.Name
+        end
+
+        local _, humanoid = getTargetCharacterParts(player)
+        local health = humanoid and math.max(0, humanoid.Health) or 0
+        local maxHealth = humanoid and math.max(1, humanoid.MaxHealth) or 100
+        local ratio = math.clamp(health / maxHealth, 0, 1)
+        healthFill.Size = UDim2.fromScale(ratio, 1)
+        local lowColor = Color3.fromRGB(156, 80, 74)
+        local midColor = Color3.fromRGB(177, 144, 83)
+        local highColor = Color3.fromRGB(88, 154, 104)
+        local fillColor
+        if ratio >= 0.5 then
+            fillColor = midColor:Lerp(highColor, (ratio - 0.5) / 0.5)
+        else
+            fillColor = lowColor:Lerp(midColor, ratio / 0.5)
+        end
+        healthFill.BackgroundColor3 = fillColor
+        healthText.Text = tostring(math.floor(health + 0.5))
+        targetPanel.Visible = true
+    end)
+
+    targetUiCleanup = function()
+        if targetConnection then
+            targetConnection:Disconnect()
+            targetConnection = nil
+        end
+        if targetPanel then
+            targetPanel:Destroy()
+        end
+    end
+end
+
 local normalModeHeight = ModeSection.ContentHeight
 local normalFovY = FovSection.Y
 local normalMiscY = CombatMiscSection.Y
-setCombatModeLayout = function(selectedMode)
+local normalTargetUIY = TargetUISection.Y
+setCombatModeLayout = function(selectedMode, instant)
     local silent = selectedMode == "Silent"
     local removedHeight = silent and 44 or 0
+    local modeHeight = normalModeHeight - removedHeight
+
     if not silent then
         smoothnessControl:SetVisible(true)
+    elseif instant then
+        smoothnessControl:SetVisible(false)
     end
 
-    ModeSection.ContentHeight = normalModeHeight - removedHeight
-    TweenService:Create(
-        ModeSection.Frame,
-        TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-        {Size = UDim2.fromOffset(258, normalModeHeight - removedHeight)}
-    ):Play()
-    TweenService:Create(
-        ModeSection.Shadow,
-        TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-        {Size = UDim2.fromOffset(258, normalModeHeight - removedHeight)}
-    ):Play()
+    ModeSection.ContentHeight = modeHeight
+
+    local function applyLayout(object, properties)
+        if instant then
+            for property, value in pairs(properties) do
+                object[property] = value
+            end
+        else
+            TweenService:Create(
+                object,
+                TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+                properties
+            ):Play()
+        end
+    end
+
+    applyLayout(ModeSection.Frame, {
+        Size = UDim2.fromOffset(258, modeHeight),
+    })
+    applyLayout(ModeSection.Shadow, {
+        Size = UDim2.fromOffset(258, modeHeight),
+    })
 
     local fovY = normalFovY - removedHeight
     FovSection.Y = fovY
-    TweenService:Create(
-        FovSection.Frame,
-        TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-        {Position = UDim2.fromOffset(0, fovY)}
-    ):Play()
-    TweenService:Create(
-        FovSection.Shadow,
-        TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-        {Position = UDim2.fromOffset(0, fovY + 1)}
-    ):Play()
+    applyLayout(FovSection.Frame, {
+        Position = UDim2.fromOffset(0, fovY),
+    })
+    applyLayout(FovSection.Shadow, {
+        Position = UDim2.fromOffset(0, fovY + 1),
+    })
 
     local miscY = normalMiscY - removedHeight
     CombatMiscSection.Y = miscY
-    TweenService:Create(
-        CombatMiscSection.Frame,
-        TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-        {Position = UDim2.fromOffset(0, miscY)}
-    ):Play()
-    TweenService:Create(
-        CombatMiscSection.Shadow,
-        TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-        {Position = UDim2.fromOffset(0, miscY + 1)}
-    ):Play()
+    applyLayout(CombatMiscSection.Frame, {
+        Position = UDim2.fromOffset(0, miscY),
+    })
+    applyLayout(CombatMiscSection.Shadow, {
+        Position = UDim2.fromOffset(0, miscY + 1),
+    })
 
-    local bottom = miscY + CombatMiscSection.ContentHeight + 10
+    local targetUiY = normalTargetUIY - removedHeight
+    TargetUISection.Y = targetUiY
+    applyLayout(TargetUISection.Frame, {
+        Position = UDim2.fromOffset(0, targetUiY),
+    })
+    applyLayout(TargetUISection.Shadow, {
+        Position = UDim2.fromOffset(0, targetUiY + 1),
+    })
+
+    local bottom = targetUiY + TargetUISection.ContentHeight + 10
     Combat.Layout.Left = bottom
     Combat.Frame.CanvasSize = UDim2.fromOffset(0, math.max(bottom, Combat.Layout.Right))
 
-    if silent then
+    if silent and not instant then
         task.delay(0.18, function()
             if runtimeAlive and State.SelectedMode == "Silent" then
                 smoothnessControl:SetVisible(false)
@@ -4611,11 +5169,13 @@ setCombatModeLayout = function(selectedMode)
     end
 end
 
+setCombatModeLayout(State.SelectedMode, true)
+
 local AimSection = makeTitledSection(Combat, "Right", "Aim Part")
-AimSection:Dropdown({
-    Name = "Aim Part",
+local aimPartDropdown = AimSection:Dropdown({
+    Name = "",
     Options = {"Root", "Head", "Upper Torso", "Left Arm", "Right Arm", "Left Leg", "Right Leg"},
-    Default = "Root",
+    Default = "Upper Torso",
     Callback = function(value)
         local values = {
             Root = "HumanoidRootPart",
@@ -4626,54 +5186,21 @@ AimSection:Dropdown({
             ["Left Leg"] = "LeftLeg",
             ["Right Leg"] = "RightLeg",
         }
-        State.AimPart = values[value] or "HumanoidRootPart"
+        State.AimPart = values[value] or "UpperTorso"
         clearTargets()
     end,
 })
+compactSectionDropdown(AimSection, aimPartDropdown)
 
-local setAdaptiveExpanded
-local adaptiveToggleControl = rememberToggle(AimSection:Toggle({
+rememberToggle(AimSection:Toggle({
     Name = "Adaptive Aim",
     Default = false,
     Callback = function(value)
-        State.AdaptiveAim = value
+        State.AdaptiveAim = value == true
+        table.clear(adaptivePartCache)
         clearTargets()
-        if setAdaptiveExpanded then
-            setAdaptiveExpanded(value)
-        end
     end,
 }))
-
-local adaptiveStrengthControl = AimSection:Slider({
-    Name = "Adaptive Strength",
-    Minimum = 0,
-    Maximum = 100,
-    Default = State.AdaptiveStrength,
-    Suffix = "%",
-    Callback = function(value)
-        State.AdaptiveStrength = value
-        table.clear(adaptivePartCache)
-    end,
-})
-
-adaptiveStrengthControl:SetVisible(false)
-local collapsedAimHeight = 106
-local adaptiveSliderSeparator
-for _, child in ipairs(AimSection.Frame:GetChildren()) do
-    if child:IsA("Frame")
-        and child.Size.Y.Offset == 1
-        and child.Position.Y.Offset == collapsedAimHeight - 1 then
-        adaptiveSliderSeparator = child
-        break
-    end
-end
-if adaptiveSliderSeparator then
-    adaptiveSliderSeparator.Visible = false
-end
-AimSection.ContentHeight = collapsedAimHeight
-AimSection.Frame.Size = UDim2.fromOffset(258, collapsedAimHeight)
-AimSection.Shadow.Size = UDim2.fromOffset(258, collapsedAimHeight)
-Combat.Layout.Right = AimSection.Y + collapsedAimHeight + 10
 
 local WallBSection = makeTitledSection(Combat, "Right", "Essentials")
 rememberToggle(WallBSection:Toggle({
@@ -4709,6 +5236,14 @@ rememberToggle(WallBSection:Toggle({
     Default = false,
     Callback = function(value)
         setFastShootEnabled(value)
+    end,
+}))
+
+rememberToggle(WallBSection:Toggle({
+    Name = "Trigger Bot",
+    Default = false,
+    Callback = function(value)
+        setTriggerBEnabled(value)
     end,
 }))
 
@@ -4908,15 +5443,6 @@ if stickyDots then
 end
 end
 
-local TriggerBotSection = makeTitledSection(Combat, "Right", "Trigger Bot")
-rememberToggle(TriggerBotSection:Toggle({
-    Name = "Trigger Bot",
-    Default = false,
-    Callback = function(value)
-        setTriggerBEnabled(value)
-    end,
-}))
-
 local ChecksSection = makeTitledSection(Combat, "Right", "Checks")
 rememberToggle(ChecksSection:Toggle({
     Name = "Wall Check",
@@ -4936,8 +5462,38 @@ rememberToggle(ChecksSection:Toggle({
     end,
 }))
 
+rememberToggle(ChecksSection:Toggle({
+    Name = "Forcefield",
+    Default = true,
+    Callback = function(value)
+        State.Forcefield = value == true
+    end,
+}))
+
+rememberToggle(ChecksSection:Toggle({
+    Name = "Friend Check",
+    Default = State.FriendCheck,
+    Callback = function(value)
+        State.FriendCheck = value == true
+
+        if State.FriendCheck then
+            for _, player in ipairs(targetPlayerList) do
+                queueFriendStatus(player)
+            end
+        end
+
+        -- Rebuild targeting immediately in both directions. Turning this OFF must
+        -- instantly make friends valid again unless another enabled check excludes them.
+        clearTargets()
+        if wallBRefreshTeams then
+            wallBRefreshTeams()
+        end
+    end,
+}))
+
 local teamCheckControl
 local syncingTeamCheck = false
+local autoCheckedTeam
 
 local function refreshTeamRuntime()
     if wallBRefreshTeams then
@@ -4946,36 +5502,48 @@ local function refreshTeamRuntime()
     clearTargets()
 end
 
-local function setCurrentTeamCheck(value, sourceTeam)
-    value = value == true
+local function setTeamControl(team, value)
+    local control = team and teamControls[team]
+    if control then
+        control:Set(value == true, true)
+    end
+end
+
+local function applyAutomaticCurrentTeamCheck()
     local currentTeam = LocalPlayer.Team
+    local currentIsUsable = currentTeam and string.lower(currentTeam.Name) ~= "neutral"
 
-    State.TeamCheck = value
+    -- The team that was checked automatically only stays checked while it is
+    -- still our current team. This is what makes the sub-toggle visibly move
+    -- with the player when they change teams.
+    if autoCheckedTeam and (not State.TeamCheck or autoCheckedTeam ~= currentTeam) then
+        State.ExcludedTeams[autoCheckedTeam.Name] = false
+        setTeamControl(autoCheckedTeam, false)
+        autoCheckedTeam = nil
+    end
 
-    if currentTeam and string.lower(currentTeam.Name) ~= "neutral" then
-        State.ExcludedTeams[currentTeam.Name] = value
-
-        local currentControl = teamControls[currentTeam]
-        if currentControl and sourceTeam ~= currentTeam then
-            currentControl:Set(value, true)
-        end
+    if State.TeamCheck and currentIsUsable then
+        State.ExcludedTeams[currentTeam.Name] = true
+        autoCheckedTeam = currentTeam
+        setTeamControl(currentTeam, true)
     end
 
     if teamCheckControl then
-        teamCheckControl:Set(value, true)
+        teamCheckControl:Set(State.TeamCheck, true)
     end
 end
 
 teamCheckControl = rememberToggle(ChecksSection:Toggle({
     Name = "Team Check",
-    Default = false,
+    Default = State.TeamCheck,
     Callback = function(value)
         if syncingTeamCheck then
             return
         end
 
         syncingTeamCheck = true
-        setCurrentTeamCheck(value)
+        State.TeamCheck = value == true
+        applyAutomaticCurrentTeamCheck()
         syncingTeamCheck = false
         refreshTeamRuntime()
     end,
@@ -5000,11 +5568,26 @@ local function addTeam(team)
         Name = "  " .. team.Name,
         Default = defaultValue,
         Callback = function(value)
-            State.ExcludedTeams[team.Name] = value == true
+            value = value == true
+            State.ExcludedTeams[team.Name] = value
 
+            -- Manually changing the currently occupied team's sub-toggle is
+            -- equivalent to changing the Team Check master toggle.
             if team == LocalPlayer.Team and not syncingTeamCheck then
                 syncingTeamCheck = true
-                setCurrentTeamCheck(value, team)
+                State.TeamCheck = value
+                if value then
+                    if autoCheckedTeam and autoCheckedTeam ~= team then
+                        State.ExcludedTeams[autoCheckedTeam.Name] = false
+                        setTeamControl(autoCheckedTeam, false)
+                    end
+                    autoCheckedTeam = team
+                elseif autoCheckedTeam == team then
+                    autoCheckedTeam = nil
+                end
+                if teamCheckControl then
+                    teamCheckControl:Set(value, true)
+                end
                 syncingTeamCheck = false
             end
 
@@ -5013,10 +5596,8 @@ local function addTeam(team)
     }))
     teamControls[team] = control
 
-    if isOwnTeam then
-        syncingTeamCheck = true
-        setCurrentTeamCheck(defaultValue, team)
-        syncingTeamCheck = false
+    if isOwnTeam and State.TeamCheck then
+        autoCheckedTeam = team
     end
 end
 
@@ -5030,93 +5611,23 @@ connect(Teams.ChildAdded, function(child)
     end
 end)
 
-connect(LocalPlayer:GetPropertyChangedSignal("Team"), function()
+local function syncCurrentTeamCheck()
     local currentTeam = LocalPlayer.Team
-
     if currentTeam and string.lower(currentTeam.Name) ~= "neutral" then
         addTeam(currentTeam)
-
-        local value = State.ExcludedTeams[currentTeam.Name] == true
-
-        syncingTeamCheck = true
-        setCurrentTeamCheck(value, currentTeam)
-        local control = teamControls[currentTeam]
-        if control then
-            control:Set(value, true)
-        end
-        syncingTeamCheck = false
-    else
-        syncingTeamCheck = true
-        State.TeamCheck = false
-        if teamCheckControl then
-            teamCheckControl:Set(false, true)
-        end
-        syncingTeamCheck = false
     end
 
+    syncingTeamCheck = true
+    applyAutomaticCurrentTeamCheck()
+    syncingTeamCheck = false
     refreshTeamRuntime()
-end)
-
-local baseWallBY = WallBSection.Y
-local baseTriggerBotY = TriggerBotSection.Y
-local baseChecksY = ChecksSection.Y
-local adaptiveLayoutExtra = 0
-
-local function moveRightSection(section, targetY)
-    section.Y = targetY
-    TweenService:Create(
-        section.Frame,
-        TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-        {Position = UDim2.fromOffset(270, targetY)}
-    ):Play()
-    TweenService:Create(
-        section.Shadow,
-        TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-        {Position = UDim2.fromOffset(270, targetY + 1)}
-    ):Play()
 end
 
-local function refreshRightSectionLayout()
-    moveRightSection(WallBSection, baseWallBY + adaptiveLayoutExtra)
-    moveRightSection(TriggerBotSection, baseTriggerBotY + adaptiveLayoutExtra)
-    moveRightSection(ChecksSection, baseChecksY + adaptiveLayoutExtra)
-    local bottom = ChecksSection.Y + ChecksSection.ContentHeight + 10
-    Combat.Layout.Right = bottom
-    Combat.Frame.CanvasSize = UDim2.fromOffset(0, math.max(Combat.Layout.Left, bottom))
-end
+connect(LocalPlayer:GetPropertyChangedSignal("Team"), syncCurrentTeamCheck)
+connect(LocalPlayer:GetPropertyChangedSignal("TeamColor"), syncCurrentTeamCheck)
+syncCurrentTeamCheck()
 
-setAdaptiveExpanded = function(expanded)
-    local extra = expanded and 44 or 0
-    adaptiveLayoutExtra = extra
-    if expanded then
-        adaptiveStrengthControl:SetVisible(true)
-    end
-    if adaptiveSliderSeparator then
-        adaptiveSliderSeparator.Visible = expanded
-    end
 
-    TweenService:Create(
-        AimSection.Frame,
-        TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-        {Size = UDim2.fromOffset(258, collapsedAimHeight + extra)}
-    ):Play()
-    TweenService:Create(
-        AimSection.Shadow,
-        TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-        {Size = UDim2.fromOffset(258, collapsedAimHeight + extra)}
-    ):Play()
-
-    AimSection.ContentHeight = collapsedAimHeight + extra
-    refreshRightSectionLayout()
-
-    if not expanded then
-        task.delay(0.18, function()
-            if runtimeAlive and not State.AdaptiveAim then
-                adaptiveStrengthControl:SetVisible(false)
-            end
-        end)
-    end
-end
 end
 
 connect(UserInputService.InputBegan, function(input, processed)
@@ -5629,11 +6140,11 @@ entitylib.targetCheck = function(entity)
     if not entity.Player then
         return false
     end
-    return not teamIsExcluded(entity.Player)
+    return not targetIsExcluded(entity.Player)
 end
 
 entitylib.isVulnerable = function(entity, attackCheck)
-    if entity.Player and teamIsExcluded(entity.Player) then
+    if entity.Player and targetIsExcluded(entity.Player) then
         return false
     end
     if attackCheck
@@ -5962,8 +6473,8 @@ local function wallBBulletHook(...)
     -- Normal Silent: redirect the shot to the selected aim part without
     -- enabling any of WallB's origin scanning / through-wall behavior.
     if not State.WallB then
-        local _, targetPart = findSilentTarget(UserInputService:GetMouseLocation())
-        if not targetPart then
+        local targetPlayer, targetPart = findSilentTarget(UserInputService:GetMouseLocation())
+        if not targetPlayer or not targetPart then
             return oldBullet(...)
         end
 
@@ -5987,7 +6498,9 @@ local function wallBBulletHook(...)
     -- Adaptive Aim authoritative instead of letting the separate Wall Bang
     -- entity scanner choose a different player.
     local targetPlayer, targetPart = findSilentTarget(UserInputService:GetMouseLocation())
-    if not targetPlayer or not targetPart or not validTarget(targetPlayer) then
+    if not targetPlayer
+        or not targetPart
+        or not validTarget(targetPlayer) then
         return oldBullet(...)
     end
     if State.WallCheck and not partVisible(targetPart) then
@@ -7457,11 +7970,11 @@ Visual.Frame.CanvasSize = UDim2.fromOffset(0, 0)
 local VisualMain = makeTitledSection(Visual, "Left", "Main")
 VisualMain:Dropdown({
     Name = "Name",
-    Options = {"Display Name", "Username", "Both", "Off"},
+    Options = {"Display Name", "Username", "Off"},
     Default = "Display Name",
     Callback = function(value)
-        ESP.NameEnabled = value == "Username" or value == "Both"
-        ESP.DisplayNameEnabled = value == "Display Name" or value == "Both"
+        ESP.NameEnabled = value == "Username"
+        ESP.DisplayNameEnabled = value == "Display Name"
     end,
 })
 VisualMain:Dropdown({
@@ -7486,7 +7999,7 @@ rememberToggle(VisualMain:Toggle({
 
 local VisualTracers = makeTitledSection(Visual, "Left", "Tracers")
 rememberToggle(VisualTracers:Toggle({
-    Name = "Tracers",
+    Name = "Toggle",
     Default = false,
     Callback = function(value)
         ESP.TracersEnabled = value
@@ -7540,7 +8053,7 @@ local function refreshBoxMode()
 end
 
 rememberToggle(VisualBox:Toggle({
-    Name = "Box",
+    Name = "Toggle",
     Default = false,
     Callback = function(value)
         ESP.BoxMasterEnabled = value
@@ -7908,9 +8421,9 @@ task.spawn(function()
 end)
 end
 
-local MovementSpinSection = makeTitledSection(MovementPage, "Left", "Spin")
+local MovementSpinSection = makeTitledSection(MovementPage, "Left", "Spinbot")
 local spinToggleControl = rememberToggle(MovementSpinSection:Toggle({
-    Name = "Spinbot",
+    Name = "Toggle",
     Default = State.Spinbot,
     Callback = function(value)
         PlayerFeatures.SetSpinbot(value)
@@ -8434,6 +8947,9 @@ local function cleanup()
     end
     if triggerBCleanup then
         pcall(triggerBCleanup)
+    end
+    if targetUiCleanup then
+        pcall(targetUiCleanup)
     end
     if PlayerFeatures.Cleanup then
         pcall(PlayerFeatures.Cleanup)
